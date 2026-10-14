@@ -2748,6 +2748,11 @@ class NPUModelRunner(GPUModelRunner):
                         for req_id in req_ids_output_copy
                     ]
 
+        # TTFT breakdown: copy timing to ModelRunnerOutput top-level fields.
+        _mro_load = kv_connector_output.worker_load_kv_time if kv_connector_output else 0.0
+        _mro_forward = kv_connector_output.worker_forward_time if kv_connector_output else 0.0
+        _mro_save = kv_connector_output.worker_save_kv_time if kv_connector_output else 0.0
+
         model_runner_output = ModelRunnerOutput(
             req_ids=req_ids_output_copy,
             req_id_to_index=req_id_to_index_output_copy,
@@ -2760,6 +2765,9 @@ class NPUModelRunner(GPUModelRunner):
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
             cudagraph_stats=cudagraph_stats,
             routed_experts=None,
+            worker_load_kv_time=_mro_load,
+            worker_forward_time=_mro_forward,
+            worker_save_kv_time=_mro_save,
         )
         if (
             profiling_chunk_config.enabled
