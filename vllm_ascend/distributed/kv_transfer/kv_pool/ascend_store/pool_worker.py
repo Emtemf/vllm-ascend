@@ -1832,13 +1832,19 @@ class KVPoolWorker:
             request.save_enqueue_time = time.perf_counter()
             send_thread.add_stored_request(request.req_id)
             send_thread.add_request(request)
-
+        enqueue_time = time.perf_counter() - ttft_start
+        join_time = 0.0
         if current_event is not None:
+            join_start = time.perf_counter()
             send_thread.request_queue.join()
+            join_time = time.perf_counter() - join_start
         logger.info(
-            "[TTFT_DEBUG][AscendStoreSave] req_ids=%s wait_for_save=%.6f",
+            "[TTFT_DEBUG][AscendStoreSave] req_ids=%s wait_for_save=%.6f "
+            "enqueue=%.6f join=%.6f",
             req_ids,
             time.perf_counter() - ttft_start,
+            enqueue_time,
+            join_time,
         )
 
     def retrieve_layer(
