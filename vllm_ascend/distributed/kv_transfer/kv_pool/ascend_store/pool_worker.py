@@ -850,6 +850,8 @@ class KVPoolWorker:
         self._start_kv_transfer_threads()
 
     def start_load_kv(self, metadata: AscendConnectorMetadata):
+        ttft_start = time.perf_counter()
+        req_ids = [request.req_id for request in metadata.requests]
         self.current_layer = 0
         self.layerwise_retrievers: list[Any] = []
         if self.use_layerwise:
@@ -862,9 +864,19 @@ class KVPoolWorker:
             reset_attention_compute_start_gate()
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
+            logger.info(
+                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+                req_ids,
+                time.perf_counter() - ttft_start,
+            )
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
+            logger.info(
+                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+                req_ids,
+                time.perf_counter() - ttft_start,
+            )
             return
         for request in metadata.requests:
             load_spec = request.load_spec
@@ -1008,6 +1020,12 @@ class KVPoolWorker:
                 load_group_ids,
                 len(key_list_c),
             )
+        logger.info(
+            "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+            req_ids,
+            time.perf_counter() - ttft_start,
+        )
+
 
     def _process_save_for_layer_batch(
         self,
@@ -1757,6 +1775,8 @@ class KVPoolWorker:
         self.current_layer = self.current_layer + 1
 
     def wait_for_save(self, connector_metadata: AscendConnectorMetadata):
+        ttft_start = time.perf_counter()
+        req_ids = [request.req_id for request in connector_metadata.requests]
         current_event = None
         assert self.kv_send_thread is not None
         send_thread = self.kv_send_thread
@@ -1775,6 +1795,11 @@ class KVPoolWorker:
 
         if current_event is not None:
             send_thread.request_queue.join()
+        logger.info(
+            "[TTFT_DEBUG][AscendStoreSave] req_ids=%s wait_for_save=%.6f",
+            req_ids,
+            time.perf_counter() - ttft_start,
+        )
 
     def retrieve_layer(
         self,

@@ -713,6 +713,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         def should_skip(start: int, end: int) -> bool:
             return skip_end > skip_start and start >= skip_start and end <= skip_end
+        build_key_time = 0.0
+        lookup_time = 0.0
+        prepare_time = 0.0
+        sync_time = 0.0
+        put_time = 0.0
+        num_put_keys = 0
+
 
         for group_id in req_meta.kv_cache_group_ids or [0]:
             group_block_size = self._get_block_size(group_id)
@@ -758,6 +765,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 chunk_start = block_idx * group_block_size
                 return mask_allows and not should_skip(chunk_start, chunk_start + group_block_size)
 
+            phase_start = time.perf_counter()
             pre_shard = self.dcp_size <= 1 and not align_state_group
             iterator = self.token_database.process_token_key_strings_with_block_ids(
                 token_len,
@@ -776,10 +784,14 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 if self.enable_kv_event:
                     block_hashes.append(block_hash)
                 key_block_ids.append(block_id)
+            build_key_time += time.perf_counter() - phase_start
+
 
             if not keys:
                 continue
+            phase_start = time.perf_counter()
             exists_states = self.lookup(keys)
+            lookup_time += time.perf_counter() - phase_start
             missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
             if not missing_indices:
                 continue
@@ -816,6 +828,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 len(keys),
                 keys[:3],
             )
+            phase_start = time.perf_counter()
             for index, start in enumerate(starts):
                 addr, size, _ = self._prepare_value(
                     start,
@@ -850,6 +863,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         )
                         stored_events.append(stored_event)
                         logger.debug("Added kv cache event '%s' to kv cache events queue", stored_event)
+            prepare_time += time.perf_counter() - phase_start
+
 
             if self.kv_role == "kv_consumer":
                 keys, addrs, sizes = self._decode_adaptor_prefill_pp(
@@ -858,11 +873,28 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     sizes,
                     kv_cache_group_id=group_id,
                 )
+            phase_start = time.perf_counter()
             if current_event is not None:
                 current_event.synchronize()
+            sync_time += time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
             self.m_store.put(keys, addrs, sizes)
+            put_time += time.perf_counter() - phase_start
+            num_put_keys += len(keys)
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
+
+        logger.info(
+            "[TTFT_DEBUG][AscendStoreSave] req_id=%s keys=%d "
+            "build_key=%.6f lookup=%.6f prepare=%.6f sync=%.6f put=%.6f",
+            req_id,
+            num_put_keys,
+            build_key_time,
+            lookup_time,
+            prepare_time,
+            sync_time,
+            put_time,
+        )
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
