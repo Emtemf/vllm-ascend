@@ -521,6 +521,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _submit_request(self, request_data: dict[str, Any]) -> None:
         peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
+        request_data.setdefault("ttft_enqueue_time", time.perf_counter())
         self._mark_request_task_submitted(request_data)
         should_start_worker = False
         with self.peer_request_queues_lock:
@@ -595,6 +596,10 @@ class KVCacheRecvingThread(threading.Thread):
         remote_handshake_port = req_meta["remote_handshake_port"]
         remote_port_send_num = req_meta["remote_port_send_num"]
         all_task_done = req_meta["all_task_done"]
+        _enqueue_ts = req_meta.get("ttft_enqueue_time")
+        req_meta["ttft_queue_wait"] = (
+            max(0.0, time.perf_counter() - _enqueue_ts) if _enqueue_ts is not None else 0.0
+        )
 
         try:
             logger.debug("Starting to transfer KV cache for request %s.", remote_request_id)
@@ -659,8 +664,10 @@ class KVCacheRecvingThread(threading.Thread):
                 remote_engine_id in self.kv_caches_base_addr
                 and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
             )
+        _meta_start = time.perf_counter()
         if not has_remote_metadata:
             self._get_remote_metadata(remote_host, remote_handshake_port)
+        _meta_fetch_time = time.perf_counter() - _meta_start
         with self.remote_metadata_lock:
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
@@ -731,7 +738,10 @@ class KVCacheRecvingThread(threading.Thread):
                     dst_list.append(dst)
                     length_list.append(length)
 
+        _build_list_time = time.perf_counter() - req_start_time
+        _transfer_start = time.perf_counter()
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        _transfer_time = time.perf_counter() - _transfer_start
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -749,6 +759,19 @@ class KVCacheRecvingThread(threading.Thread):
             get_ip(),
             self.tp_rank,
             session_id,
+        )
+        logger.info(
+            "[TTFT_DEBUG][HybridLoad] req_id=%s blocks=%d bytes=%d "
+            "queue_wait=%.6f meta_fetch=%.6f build_list=%.6f "
+            "transfer=%.6f total=%.6f",
+            remote_request_id,
+            num_local_blocks,
+            sum(length_list),
+            req_meta.get("ttft_queue_wait", 0.0),
+            _meta_fetch_time,
+            _build_list_time,
+            _transfer_time,
+            _meta_fetch_time + req_transfer_elapsed / 1000.0,
         )
 
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
@@ -774,6 +797,7 @@ class KVCacheRecvingThread(threading.Thread):
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         # Check if we have the remote metadata cached.
+        _meta_start = time.perf_counter()
         with self.remote_metadata_lock:
             has_remote_metadata = (
                 remote_engine_id in self.kv_caches_base_addr
@@ -781,6 +805,7 @@ class KVCacheRecvingThread(threading.Thread):
             )
         if not has_remote_metadata:
             self._get_remote_metadata(remote_host, remote_handshake_port)
+        _meta_fetch_time = time.perf_counter() - _meta_start
 
         if tp_num_need_pulls == 1:
             grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
@@ -830,8 +855,11 @@ class KVCacheRecvingThread(threading.Thread):
                 src_list.append(src)
                 dst_list.append(dst)
                 length_list.append(length)
+        _build_list_time = time.perf_counter() - req_start_time
+        _transfer_start = time.perf_counter()
 
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
+        _transfer_time = time.perf_counter() - _transfer_start
         if ret < 0:
             logger.error(
                 "Mooncake transfer failed for request. remote_request_id=%s, ret=%d. ",
@@ -860,6 +888,7 @@ class KVCacheRecvingThread(threading.Thread):
         need_cat_cache = tp_num_need_pulls > 1 and is_kv_transfer_end
         need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
         use_fused_op = get_ascend_config().enable_transpose_kv_cache_by_block
+        _reformat_start = time.perf_counter()
         if need_nz_cache or need_cat_cache:
             # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
             if use_fused_op and enable_custom_op():
@@ -871,6 +900,24 @@ class KVCacheRecvingThread(threading.Thread):
                     self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
             else:
                 self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+        _reformat_time = time.perf_counter() - _reformat_start
+        logger.info(
+            "[TTFT_DEBUG][HybridLoad] req_id=%s blocks=%d bytes=%d "
+            "queue_wait=%.6f meta_fetch=%.6f build_list=%.6f "
+            "transfer=%.6f reformat=%.6f total=%.6f",
+            remote_request_id,
+            num_blocks,
+            sum(length_list),
+            req_meta.get("ttft_queue_wait", 0.0),
+            _meta_fetch_time,
+            _build_list_time,
+            _transfer_time,
+            _reformat_time,
+            _meta_fetch_time
+            + _build_list_time
+            + _transfer_time
+            + _reformat_time,
+        )
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters
