@@ -916,6 +916,7 @@ class KVPoolWorker:
                 self.load_async,
             )
             if self.load_async:
+                request.load_enqueue_time = time.perf_counter()
                 self.kv_recv_thread.add_request(  # type: ignore[union-attr]
                     request,
                 )
@@ -937,8 +938,8 @@ class KVPoolWorker:
             size_list = []
             key_list = []
             block_id_list: list[int] = []
-            load_masks = self.token_database.load_mask(request.block_hashes, token_len)
             build_key_start = time.perf_counter()
+            load_masks = self.token_database.load_mask(request.block_hashes, token_len)
             prepare_time = 0.0
             for group_id in load_group_ids:
                 if group_id >= len(request.block_ids_by_group):
@@ -1047,7 +1048,7 @@ class KVPoolWorker:
                 "result=%.6f other=%.6f",
                 request.req_id,
                 len(key_list_c),
-                sum(size_list_c),
+                sum(sum(s) if isinstance(s, list) else s for s in size_list_c),
                 total_time,
                 build_key_time,
                 prepare_time,

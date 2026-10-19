@@ -887,7 +887,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
-            num_put_bytes += sum(sizes)
+            num_put_bytes += sum(sum(s) if isinstance(s, list) else s for s in sizes)
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
 
@@ -948,6 +948,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self.worker = worker
 
     def _handle_request(self, req_meta: ReqMeta):
+        handle_start = time.perf_counter()
         try:
             load_spec = req_meta.load_spec
             req_id = req_meta.req_id
@@ -969,6 +970,13 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 self.set_finished_request(req_id)
                 return
 
+            queue_wait_time = (
+                max(0.0, handle_start - req_meta.load_enqueue_time)
+                if req_meta.load_enqueue_time is not None
+                else 0.0
+            )
+            build_key_start = time.perf_counter()
+            prepare_time = 0.0
             addr_list = []
             size_list = []
             key_list = []
@@ -993,6 +1001,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     chunk_filter=chunk_filter,
                 )
                 for start, end, key, _block_hash, block_id in token_iter:
+                    prepare_start = time.perf_counter()
                     addr, size, block_id = self._prepare_value(
                         start,
                         end,
@@ -1000,10 +1009,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         kv_cache_group_id=group_id,
                         block_id=block_id,
                     )
+                    prepare_time += time.perf_counter() - prepare_start
                     key_list.append(key)
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+            build_key_time = time.perf_counter() - build_key_start - prepare_time
             if not key_list:
                 self.set_finished_request(req_id)
                 return
@@ -1021,7 +1032,10 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 len(key_list_c),
                 key_list_c[:3],
             )
+            get_start = time.perf_counter()
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            get_time = time.perf_counter() - get_start
+            result_start = time.perf_counter()
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,
@@ -1054,6 +1068,31 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         req_id,
                         missing_block_ids,
                     )
+            result_time = time.perf_counter() - result_start
+            total_time = time.perf_counter() - handle_start
+            other_time = max(
+                0.0,
+                total_time
+                - build_key_time
+                - prepare_time
+                - get_time
+                - result_time,
+            )
+            logger.info(
+                "[TTFT_DEBUG][AscendStoreLoad] req_id=%s keys=%d bytes=%d "
+                "queue_wait=%.6f total=%.6f build_key=%.6f prepare=%.6f "
+                "get=%.6f result=%.6f other=%.6f load_async=True",
+                req_id,
+                len(key_list_c),
+                sum(sum(s) if isinstance(s, list) else s for s in size_list_c),
+                queue_wait_time,
+                total_time,
+                build_key_time,
+                prepare_time,
+                get_time,
+                result_time,
+                other_time,
+            )
             logger.debug(
                 "KV pool async recv backend get returned request=%s token_len=%d groups=%s keys=%d",
                 req_id,
