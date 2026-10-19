@@ -865,17 +865,23 @@ class KVPoolWorker:
         logger.debug("KV pool worker start_load_kv requests=%d", len(metadata.requests))
         if len(metadata.requests) == 0:
             logger.info(
-                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f "
+                "load_async=%s use_layerwise=%s",
                 req_ids,
                 time.perf_counter() - ttft_start,
+                self.load_async,
+                self.use_layerwise,
             )
             return
         if self.use_layerwise:
             self.process_layer_data(metadata.requests)
             logger.info(
-                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+                "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f "
+                "load_async=%s use_layerwise=%s",
                 req_ids,
                 time.perf_counter() - ttft_start,
+                self.load_async,
+                self.use_layerwise,
             )
             return
         for request in metadata.requests:
@@ -887,6 +893,7 @@ class KVPoolWorker:
                     "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}",
                 )
                 continue
+            request_start = time.perf_counter()
             request.skip_null_blocks_by_group = self.group_uses_align_state
             load_group_ids = request.kv_cache_group_ids or [0]
             token_len = request.token_len_chunk
@@ -931,6 +938,8 @@ class KVPoolWorker:
             key_list = []
             block_id_list: list[int] = []
             load_masks = self.token_database.load_mask(request.block_hashes, token_len)
+            build_key_start = time.perf_counter()
+            prepare_time = 0.0
             for group_id in load_group_ids:
                 if group_id >= len(request.block_ids_by_group):
                     continue
@@ -957,6 +966,7 @@ class KVPoolWorker:
                     skip_null_blocks=skip_null,
                     chunk_filter=chunk_filter,
                 ):
+                    prepare_start = time.perf_counter()
                     addr, size, block_id = self.token_database.prepare_value(
                         start,
                         end,
@@ -964,10 +974,12 @@ class KVPoolWorker:
                         kv_cache_group_id=group_id,
                         block_id=block_id,
                     )
+                    prepare_time += time.perf_counter() - prepare_start
                     key_list.append(key)
                     addr_list.append(addr)
                     size_list.append(size)
                     block_id_list.append(block_id)
+            build_key_time = time.perf_counter() - build_key_start - prepare_time
             if not key_list:
                 continue
             key_list_c = _circular_shift(key_list, self.tp_rank % len(key_list))
@@ -982,7 +994,10 @@ class KVPoolWorker:
                 len(key_list_c),
                 key_list_c[:3],
             )
+            get_start = time.perf_counter()
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            get_time = time.perf_counter() - get_start
+            result_start = time.perf_counter()
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,
@@ -1020,10 +1035,33 @@ class KVPoolWorker:
                 load_group_ids,
                 len(key_list_c),
             )
+            result_time = time.perf_counter() - result_start
+            total_time = time.perf_counter() - request_start
+            other_time = max(
+                0.0,
+                total_time - build_key_time - prepare_time - get_time - result_time,
+            )
+            logger.info(
+                "[TTFT_DEBUG][AscendStoreLoad] req_id=%s keys=%d bytes=%d "
+                "total=%.6f build_key=%.6f prepare=%.6f get=%.6f "
+                "result=%.6f other=%.6f",
+                request.req_id,
+                len(key_list_c),
+                sum(size_list_c),
+                total_time,
+                build_key_time,
+                prepare_time,
+                get_time,
+                result_time,
+                other_time,
+            )
         logger.info(
-            "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f",
+            "[TTFT_DEBUG][AscendStoreLoad] req_ids=%s start_load_kv=%.6f "
+            "load_async=%s use_layerwise=%s",
             req_ids,
             time.perf_counter() - ttft_start,
+            self.load_async,
+            self.use_layerwise,
         )
 
 
@@ -1790,6 +1828,7 @@ class KVPoolWorker:
                 current_event.record()
             request.skip_null_blocks_by_group = self.group_uses_align_state
             request.current_event = current_event
+            request.save_enqueue_time = time.perf_counter()
             send_thread.add_stored_request(request.req_id)
             send_thread.add_request(request)
 

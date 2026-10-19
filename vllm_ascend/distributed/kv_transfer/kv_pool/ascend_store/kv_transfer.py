@@ -691,6 +691,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
     def _handle_stored_request(self, req_meta: ReqMeta):
         """Store missing KV chunks for one request."""
+        handle_start = time.perf_counter()
         token_len = req_meta.token_len_chunk
         req_id = req_meta.req_id
         current_event = req_meta.current_event
@@ -713,13 +714,18 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
         def should_skip(start: int, end: int) -> bool:
             return skip_end > skip_start and start >= skip_start and end <= skip_end
+        queue_wait_time = (
+            max(0.0, handle_start - req_meta.save_enqueue_time)
+            if req_meta.save_enqueue_time is not None
+            else 0.0
+        )
         build_key_time = 0.0
         lookup_time = 0.0
         prepare_time = 0.0
         sync_time = 0.0
         put_time = 0.0
         num_put_keys = 0
-
+        num_put_bytes = 0
 
         for group_id in req_meta.kv_cache_group_ids or [0]:
             group_block_size = self._get_block_size(group_id)
@@ -881,19 +887,35 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
+            num_put_bytes += sum(sizes)
             if self.enable_kv_event and stored_events:
                 self.update_kv_event(stored_events)
 
+        handle_total_time = time.perf_counter() - handle_start
+        other_time = max(
+            0.0,
+            handle_total_time
+            - build_key_time
+            - lookup_time
+            - prepare_time
+            - sync_time
+            - put_time,
+        )
         logger.info(
-            "[TTFT_DEBUG][AscendStoreSave] req_id=%s keys=%d "
-            "build_key=%.6f lookup=%.6f prepare=%.6f sync=%.6f put=%.6f",
+            "[TTFT_DEBUG][AscendStoreSave] req_id=%s keys=%d bytes=%d "
+            "queue_wait=%.6f total=%.6f build_key=%.6f lookup=%.6f "
+            "prepare=%.6f sync=%.6f put=%.6f other=%.6f",
             req_id,
             num_put_keys,
+            num_put_bytes,
+            queue_wait_time,
+            handle_total_time,
             build_key_time,
             lookup_time,
             prepare_time,
             sync_time,
             put_time,
+            other_time,
         )
 
 

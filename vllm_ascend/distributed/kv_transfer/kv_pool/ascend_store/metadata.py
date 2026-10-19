@@ -878,6 +878,7 @@ class ReqMeta:
     is_last_chunk: bool | None = None
 
     current_event: torch.npu.Event | None = None
+    save_enqueue_time: float | None = None
     kv_cache_group_ids: list[int] | None = None
     skip_null_blocks_by_group: list[bool] | None = None
     num_prompt_tokens: int | None = None
@@ -937,6 +938,7 @@ class ReqMeta:
         self.load_spec = load_spec
         self.is_last_chunk = is_last_chunk
         self.current_event = current_event
+        self.save_enqueue_time = None
         self.kv_cache_group_ids = kv_cache_group_ids
         self.skip_null_blocks_by_group = skip_null_blocks_by_group
         self.num_prompt_tokens = num_prompt_tokens
