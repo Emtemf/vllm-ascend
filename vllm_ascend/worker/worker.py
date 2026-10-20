@@ -565,15 +565,7 @@ class NPUWorker(WorkerBase):
                 GiB(self.init_snapshot.free_memory),
                 GiB(kv_cache_memory_bytes),
             )
-            available = self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
-            logger.info(
-                "[KV_MEMORY] rank=%d mode=manual 手动KV预算=%.2fGiB "
-                "有效KV预算=%.2fGiB（跳过显存分账，不按gpu_memory_utilization计算）",
-                self.rank,
-                GiB(kv_cache_memory_bytes),
-                GiB(available),
-            )
-            return available
+            return self._apply_kv_offload_decode_memory_constraints(kv_cache_memory_bytes)
 
         # Execute a forward pass with dummy inputs to profile the memory usage
         # of the model.
@@ -611,26 +603,6 @@ class NPUWorker(WorkerBase):
             "isolate vLLM in its own container."
         )
         self.available_kv_cache_memory_bytes = self.requested_memory - profile_result.non_kv_cache_memory
-        logger.info(
-            "[KV_MEMORY] rank=%d 单卡HBM总量=%.2fGiB 启动时空闲=%.2fGiB\n"
-            "[KV_MEMORY] rank=%d 利用率=%.4f 引擎预算=%.2fGiB\n"
-            "[KV_MEMORY] rank=%d 模型权重=%.2fGiB 激活峰值增量=%.2fGiB "
-            "非Torch增量=%.2fGiB\n"
-            "[KV_MEMORY] rank=%d 物理KV预算=%.2fGiB "
-            "（引擎预算-权重-激活峰值增量-非Torch增量；不是实时空闲）",
-            self.rank,
-            GiB(self.init_snapshot.total_memory),
-            GiB(self.init_snapshot.free_memory),
-            self.rank,
-            self.cache_config.gpu_memory_utilization,
-            GiB(self.requested_memory),
-            self.rank,
-            GiB(profile_result.weights_memory),
-            GiB(profile_result.torch_peak_increase),
-            GiB(profile_result.non_torch_increase),
-            self.rank,
-            GiB(self.available_kv_cache_memory_bytes),
-        )
 
         extra_config = get_layerwise_reuse_config(self.vllm_config.kv_transfer_config)
         if extra_config is not None:
@@ -658,12 +630,6 @@ class NPUWorker(WorkerBase):
         )
         self.available_kv_cache_memory_bytes = self._apply_kv_offload_decode_memory_constraints(
             self.available_kv_cache_memory_bytes
-        )
-        logger.info(
-            "[KV_MEMORY] rank=%d 有效KV预算=%.2fGiB "
-            "（含层复用/卸载约束调整；后续容量检查仍可能受block覆盖配置影响）",
-            self.rank,
-            GiB(self.available_kv_cache_memory_bytes),
         )
 
         return int(self.available_kv_cache_memory_bytes)

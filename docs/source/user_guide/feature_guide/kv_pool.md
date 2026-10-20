@@ -1364,26 +1364,3 @@ Ensure `free -h` **available** on the host exceeds this sum plus vLLM overhead. 
 
 For the temporary DSv4 known issue, see:
 <https://github.com/vllm-project/vllm-ascend/issues/9975>
-
-### 5.6. Reading KV device-memory capacity failures
-
-Filter the startup log without enabling DEBUG:
-
-```bash
-grep -F '[KV_MEMORY]' worker.log
-```
-
-Ascend workers report each rank's total HBM, initial free memory, utilization
-budget, model weights, activation peak increase, non-Torch increase, and physical
-KV budget before the capacity check. The physical KV budget is the utilization
-budget minus these three profiled categories; it is not a live free-memory reading.
-The effective KV budget additionally reflects layer-reuse and offload constraints.
-Explicit `kv_cache_memory_bytes` uses a separately labelled manual-budget path
-without a profiling breakdown.
-
-With the accompanying vLLM diagnostics, an insufficient-capacity error reports
-the requested `max_model_len`, required and available KV memory, the shortfall,
-and an estimated supported length. This check is per worker, not against the sum
-of HBM across the machine. Block-count overrides can further change the capacity
-used by this check. These logs do not change memory allocation or configuration.
-
