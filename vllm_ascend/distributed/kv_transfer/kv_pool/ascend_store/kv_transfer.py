@@ -15,6 +15,7 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as store_diag
 
 # isort: off
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
@@ -339,7 +340,8 @@ class KVTransferThread(threading.Thread):
         return self.block_size
 
     def add_request(self, request: Any) -> None:
-        self.request_queue.put(request)
+        captured = store_diag.capture(request, "save", self.tp_rank)
+        self.request_queue.put(captured if store_diag.enabled() else request)
 
     def get_and_clear_finished_requests(
         self,
@@ -497,7 +499,11 @@ class KVTransferThread(threading.Thread):
                     logger.warning("Received a None request. This indicates queue shutdown or invalid request.")
                     self.request_queue.task_done()
                     continue
-                self._handle_request(request_data)
+                if isinstance(request_data, store_diag.CapturedTask):
+                    with store_diag.execute(request_data):
+                        self._handle_request(request_data.payload)
+                else:
+                    self._handle_request(request_data)
             except Exception as e:
                 self._fatal_error = e
                 logger.error(

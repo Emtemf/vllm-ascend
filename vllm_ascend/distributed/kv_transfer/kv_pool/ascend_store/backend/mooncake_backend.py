@@ -18,6 +18,7 @@ from vllm.utils.network_utils import get_ip
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as store_diag
 from vllm_ascend.distributed.parallel_state import get_global_rank
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 1073741824  # 1.0 GiB
@@ -190,7 +191,7 @@ class MooncakeBackend(Backend):
             return [0] * len(keys)
         assert self.store is not None
         return self.store.batch_is_exist(keys)
-
+    @backend_operation("put")
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None
@@ -200,9 +201,15 @@ class MooncakeBackend(Backend):
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
             res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            store_diag.operation_result(
+                "ok",
+                prefer_alloc_in_same_node=self.config.prefer_alloc_in_same_node,
+                preferred_segment=self.config.preferred_segment,
+            )
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
+                store_diag.operation_result("error", failed_keys=failed_count)
                 error_codes = sorted(set(failed_codes))
                 logger.error(
                     "Failed to put %d keys out of %d. error_codes=%s. Check memory and store capacity.",
@@ -224,7 +231,7 @@ class MooncakeBackend(Backend):
             logger.debug("Failed to put key details. keys=%s", keys)
             if self._lazy_init:
                 logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
-
+    @backend_operation("get")
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
             logger.error(

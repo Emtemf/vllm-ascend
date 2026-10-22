@@ -37,6 +37,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.coordinator import
     AscendStoreCoordinator,
     ExternalCachedBlockPool,
 )
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as store_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer import (
     KVCacheStoreKeyLayerRecvingThread,
     KVCacheStoreKeyLayerSendingThread,
@@ -892,6 +893,9 @@ class KVPoolWorker:
                     request.req_id,
                     "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}",
                 )
+                store_diag.task_skip(
+                    "no_load_spec" if load_spec is None else f"can_load={load_spec.can_load}"
+                )
                 continue
             request_start = time.perf_counter()
             request.skip_null_blocks_by_group = self.group_uses_align_state
@@ -996,7 +1000,10 @@ class KVPoolWorker:
                 key_list_c[:3],
             )
             get_start = time.perf_counter()
-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            with store_diag.request_load(
+                request, asynchronous=False, rank=self.tp_rank
+            ):
+                ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
             get_time = time.perf_counter() - get_start
             result_start = time.perf_counter()
             if ret is not None and any(r != 0 for r in ret):
@@ -1823,6 +1830,7 @@ class KVPoolWorker:
         for request in connector_metadata.requests:
             can_save = request.can_save
             if can_save is None or not can_save:
+                store_diag.save_skip(request, self.tp_rank)
                 continue
             if current_event is None:
                 current_event = torch.npu.Event()

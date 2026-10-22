@@ -52,6 +52,7 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
     normalize_block_ids_by_group,
     uses_hybrid_kv_cache,
 )
+from vllm.v1.metrics import ttft_diagnostics as store_diag
 
 
 class KVPoolScheduler:
@@ -502,6 +503,14 @@ class KVPoolScheduler:
                 )
 
         if num_external_hit_tokens == 0:
+            store_diag.emit(
+                "request_match",
+                request_id=request.request_id,
+                source="get_num_new_matched_tokens",
+                local_tokens=num_computed_tokens,
+                external_tokens=0,
+                result="miss",
+            )
             return 0, False
 
         store_skip_tokens = num_external_hit_tokens
@@ -549,6 +558,14 @@ class KVPoolScheduler:
             kvpool_cached_tokens=num_external_hit_tokens,
             can_load=force_layerwise_load,
             kvpool_store_skip_tokens=store_skip_tokens,
+        )
+        store_diag.emit(
+            "request_match",
+            request_id=request.request_id,
+            source="get_num_new_matched_tokens",
+            local_tokens=num_computed_tokens,
+            external_tokens=num_external_hit_tokens,
+            result="hit" if need_to_allocate > 0 else "covered_locally",
         )
         logger.debug(
             "KV pool load spec created req=%s vllm_cached=%d kvpool_cached=%d "
