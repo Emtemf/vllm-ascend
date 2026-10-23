@@ -24,7 +24,9 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import ttft_diagnostics as diag
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import ttft_diagnostics as store_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -887,6 +889,9 @@ class KVPoolWorker:
         for request in metadata.requests:
             load_spec = request.load_spec
             if load_spec is None or not load_spec.can_load:  # load =0
+                if diag.enabled():
+                    store_diag.decision("load_disabled", direction="load", request_ids=(request.req_id,),
+                                        tp_rank=self.tp_rank)
                 logger.debug(
                     "KV pool worker skip get req=%s reason=%s",
                     request.req_id,
@@ -926,12 +931,18 @@ class KVPoolWorker:
                 # TP mismatch is restricted to non-hybrid, single-group KV.
                 group_block_size = self.grouped_block_size[0]
                 mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
-                self._load_kv_tp_mismatch(
-                    request.block_hashes,
-                    request.block_ids_by_group[0],
-                    token_len,
-                    mask_num,
-                )
+                if diag.enabled():
+                    with diag.scope(request_ids=(request.req_id,), tp_rank=self.tp_rank, direction="load"):
+                        self._load_kv_tp_mismatch(
+                            request.block_hashes, request.block_ids_by_group[0], token_len, mask_num
+                        )
+                else:
+                    self._load_kv_tp_mismatch(
+                        request.block_hashes,
+                        request.block_ids_by_group[0],
+                        token_len,
+                        mask_num,
+                    )
                 continue
 
             addr_list = []
@@ -996,7 +1007,12 @@ class KVPoolWorker:
                 key_list_c[:3],
             )
             get_start = time.perf_counter()
-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if diag.enabled():
+                with diag.scope(request_ids=(request.req_id,), tp_rank=self.tp_rank, direction="load"):
+                    store_diag.submitted(size_list_c, len(key_list_c), direction="load", operation="get")
+                    ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            else:
+                ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
             get_time = time.perf_counter() - get_start
             result_start = time.perf_counter()
             if ret is not None and any(r != 0 for r in ret):
@@ -1078,11 +1094,17 @@ class KVPoolWorker:
         # (e.g. MLA latent), so they skip save to avoid redundant writes.
         # TODO(lf): Distribute KV block writes across ranks in the put_step group.
         if self.tp_rank % self.put_step != 0:
+            if diag.enabled():
+                store_diag.decision("rank_not_writer", request_ids=tuple(request.req_id for request in requests),
+                                    tp_rank=self.tp_rank, layer_ids=(layer_id,), group_id=group_id)
             return
         block_size = get_group_block_size(self.grouped_block_size, group_id)
         request_block_ranges = []
         for request in requests:
             if request.can_save is None or not request.can_save:
+                if diag.enabled():
+                    store_diag.decision("save_disabled", request_ids=(request.req_id,), tp_rank=self.tp_rank,
+                                        layer_ids=(layer_id,), group_id=group_id)
                 continue
             save_start_block = request.save_start_token // block_size
             save_end_block = request.save_end_token // block_size
@@ -1107,10 +1129,17 @@ class KVPoolWorker:
                     else request.load_spec.kvpool_cached_tokens
                 )
                 hit_full_blocks = pool_hit_tokens // block_size
+                if diag.enabled():
+                    store_diag.decision("pooled_blocks_skipped", request_ids=(request.req_id,),
+                                        tp_rank=self.tp_rank, layer_ids=(layer_id,), group_id=group_id,
+                                        count=max(0, hit_full_blocks - save_start_block))
                 save_start_block = max(save_start_block, hit_full_blocks)
             if partial_block_index is None:
                 partial_block_index = request.partial_block_index
             if save_start_block >= save_end_block and partial_block_index is None:
+                if diag.enabled():
+                    store_diag.decision("no_save_range", request_ids=(request.req_id,), tp_rank=self.tp_rank,
+                                        layer_ids=(layer_id,), group_id=group_id, count=0)
                 continue
             request_block_ranges.append(
                 LayerBlockRange(
@@ -1241,7 +1270,15 @@ class KVPoolWorker:
         cached_keys = list(dict.fromkeys(key for key in keys if key in self._allocated_gvas))
         if not cached_keys:
             return
-        exists_states = self.m_store.batch_is_exist(cached_keys)
+        if diag.enabled():
+            with diag.span("store_gva_lookup", count=len(cached_keys), tp_rank=self.tp_rank, direction="save"):
+                exists_states = self.m_store.batch_is_exist(cached_keys)
+            diag.emit("store_gva_lookup_result", status="returned", count=len(cached_keys),
+                      returned_count=len(exists_states), hit_count=sum(state == 1 for state in exists_states),
+                      miss_count=sum(state == 0 for state in exists_states),
+                      error_count=sum(state not in (0, 1) for state in exists_states))
+        else:
+            exists_states = self.m_store.batch_is_exist(cached_keys)
         if len(exists_states) != len(cached_keys):
             raise RuntimeError(
                 "MemCache exists check returned unexpected number of states: "
@@ -1311,7 +1348,11 @@ class KVPoolWorker:
                         min(save_end_block, len(group_block_hashes)),
                     )
                 ]
-                self._refresh_allocated_gvas(candidate_keys)
+                if diag.enabled():
+                    with diag.scope(request_ids=(request.req_id,), tp_rank=self.tp_rank, group_id=group_id):
+                        self._refresh_allocated_gvas(candidate_keys)
+                else:
+                    self._refresh_allocated_gvas(candidate_keys)
                 # Skip blocks that are still present and readable in MemCache.
                 while save_start_block < save_end_block and save_start_block < len(group_block_hashes):
                     key = self._make_layerwise_full_key(
@@ -1799,6 +1840,10 @@ class KVPoolWorker:
                     send_thread.add_stored_request(block_range.request.req_id)
             send_thread.add_request(self.layer_save_tasks[self.current_layer])  # type: ignore[arg-type]
         else:
+            if diag.enabled():
+                store_diag.decision("no_layer_tasks", request_ids=tuple(
+                    request.req_id for request in connector_metadata.requests
+                ), tp_rank=self.tp_rank, layer_ids=(self.current_layer,))
             self.layer_save_finished_events[self.current_layer].set()
         if self.current_layer == self.num_layers - 1:
             while not self.layer_save_finished_events[self.num_layers - 1].wait(timeout=10):
@@ -1822,6 +1867,9 @@ class KVPoolWorker:
 
         for request in connector_metadata.requests:
             can_save = request.can_save
+            if diag.enabled():
+                store_diag.decision("save_allowed" if can_save else "save_disabled",
+                                    request_ids=(request.req_id,), tp_rank=self.tp_rank)
             if can_save is None or not can_save:
                 continue
             if current_event is None:
@@ -2102,10 +2150,14 @@ class KVPoolWorker:
                 req_meta.block_hashes, block_ids, token_len, mask_num=0
             )
             if not keys:
+                if diag.enabled():
+                    store_diag.decision("no_keys", request_ids=(req_id,), tp_rank=self.tp_rank, count=0)
                 return
             exists_states = send_thread.lookup(keys)  # type: ignore[attr-defined]
             missing_indices = [i for i, exists in enumerate(exists_states) if not exists]
             if not missing_indices:
+                if diag.enabled():
+                    store_diag.decision("all_hit", request_ids=(req_id,), tp_rank=self.tp_rank, count=len(keys))
                 return
             keys = [keys[i] for i in missing_indices]
             addrs = [addrs[i] for i in missing_indices]
@@ -2118,6 +2170,8 @@ class KVPoolWorker:
                 len(keys),
                 keys[:3],
             )
+            if diag.enabled():
+                store_diag.submitted(sizes, len(keys))
             self.m_store.put(keys, addrs, sizes)
 
             if self.enable_kv_events:

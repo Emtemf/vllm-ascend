@@ -15,6 +15,7 @@ from vllm.config import ParallelConfig
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
+from vllm.v1.metrics import ttft_diagnostics as diag
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
@@ -74,6 +75,10 @@ class MooncakeBackend(Backend):
         self._contribute_memory = contribute_memory
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
+        # Set by _setup_store when diagnostics are on: True only if this Mooncake
+        # client exposes the traced put API. False => put degrades to the original
+        # API (Python-side logs still emit, native lines carry no trace_id).
+        self._native_trace_supported = False
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -163,6 +168,22 @@ class MooncakeBackend(Backend):
                 self.config.ssd_offload_path,
             )
         logger.info("Mooncake tenant_id=%s", self.config.tenant_id)
+        if diag.enabled():
+            # Probe the optional traced-put API. Absent (older/unrecompiled
+            # Mooncake, or a read-only D node) => degrade, do not fail startup.
+            capability = getattr(store, "supports_batch_put_trace", None)
+            traced_put = getattr(store, "batch_put_from_multi_buffers_with_trace", None)
+            self._native_trace_supported = bool(
+                callable(capability) and callable(traced_put) and capability()
+            )
+            if not self._native_trace_supported:
+                logger.warning(
+                    "TTFT diagnostics enabled but this Mooncake client lacks "
+                    "supports_batch_put_trace()/batch_put_from_multi_buffers_with_trace(); "
+                    "put falls back to the original API. Python-side [TTFT_DIAG] logs "
+                    "still emit, but native BatchPutTiming lines carry no trace_id. "
+                    "Rebuild Mooncake with the trace API to link native put phases."
+                )
         return store
 
     @classmethod
@@ -194,12 +215,38 @@ class MooncakeBackend(Backend):
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         self.ensure_initialized()
         assert self.store is not None
+        if diag.enabled():
+            native_called = False
         try:
             config = ReplicateConfig()
             if self.config.preferred_segment:
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            if diag.enabled():
+                traced = self._native_trace_supported
+                trace_id = diag.new_id("put") if traced else None
+                native_trace = "linked" if traced else "unavailable"
+                scope_fields = {"trace_id": trace_id} if traced else {}
+                with diag.scope(**scope_fields):
+                    with diag.span("store_backend_put", direction="save", count=len(keys),
+                                   bytes=sum(sum(size) for size in sizes),
+                                   native_trace=native_trace):
+                        native_called = True
+                        if traced:
+                            res = self.store.batch_put_from_multi_buffers_with_trace(
+                                keys, addrs, sizes, config, trace_id
+                            )
+                        else:
+                            # Degrade: original API; Python logs still emitted, but
+                            # native BatchPutTiming lines carry no trace_id to join on.
+                            res = self.store.batch_put_from_multi_buffers(
+                                keys, addrs, sizes, config
+                            )
+                    diag.emit("store_backend_put_result", direction="save", status="returned",
+                              native_trace=native_trace,
+                              returned_count=len(res), failed_count=sum(value < 0 for value in res))
+            else:
+                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -214,6 +261,9 @@ class MooncakeBackend(Backend):
                 if self._lazy_init:
                     logger.warning("First DSV4(compress) request failure is expected. This is normal behavior.")
         except Exception as e:
+            if diag.enabled():
+                diag.emit("store_backend_put_error", direction="save", status="error",
+                          error_type=type(e).__name__, suppressed=True, executed=native_called)
             logger.error(
                 "Failed to put %d keys out of %d. type=%s, error=%s. Check store state and memory.",
                 len(keys),
@@ -227,6 +277,9 @@ class MooncakeBackend(Backend):
 
     def get(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]):
         if self._lazy_init and not self._store_initialized:
+            if diag.enabled():
+                diag.emit("store_backend_get_result", direction="load", status="not_executed",
+                          reason="store_not_initialized", count=len(keys))
             logger.error(
                 "Failed to get %d keys out of %d. Store is not initialized; "
                 "call put() first to trigger initialization.",
@@ -241,12 +294,23 @@ class MooncakeBackend(Backend):
             len(keys),
             keys[:3],
         )
+        if diag.enabled():
+            native_called = False
         try:
-            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            if diag.enabled():
+                with diag.span("store_backend_get", direction="load", count=len(keys),
+                               bytes=sum(sum(size) for size in sizes)):
+                    native_called = True
+                    res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+            else:
+                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             error_codes = sorted(set(failed_codes))
+            if diag.enabled():
+                diag.emit("store_backend_get_result", direction="load", status="returned",
+                          returned_count=len(res_list), failed_count=failed_count)
             if failed_count:
                 logger.error(
                     "Failed to get %d keys out of %d. error_codes=%s. Check key existence and memory state.",
@@ -260,6 +324,9 @@ class MooncakeBackend(Backend):
                     res_list[i] = 0
             return res_list
         except Exception as e:
+            if diag.enabled():
+                diag.emit("store_backend_get_error", direction="load", status="error",
+                          error_type=type(e).__name__, suppressed=True, executed=native_called)
             logger.error(
                 "Failed to get %d keys out of %d. type=%s, error=%s. Check store state and network.",
                 len(keys),

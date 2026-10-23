@@ -96,6 +96,7 @@ _vllm_mock_modules = [
     "vllm.v1.core.single_type_kv_cache_manager",
     "vllm.v1.kv_cache_interface",
     "vllm.v1.kv_cache_spec_registry",
+    "vllm.v1.metrics",
     "vllm.v1.outputs",
     "vllm.v1.request",
     "vllm.v1.serial_utils",
@@ -109,6 +110,7 @@ if _MOCK_VLLM_DEPS:
 if _MOCK_VLLM_DEPS:
     sys.modules["vllm.utils.math_utils"].cdiv = lambda a, b: -(-a // b)  # type: ignore[attr-defined]
     sys.modules["vllm.logger"].logger = logging.getLogger("vllm")  # type: ignore[attr-defined]
+    sys.modules["vllm.v1.metrics"].ttft_diagnostics.enabled.return_value = False
 
 _base_mod: Any = (
     sys.modules["vllm.distributed.kv_transfer.kv_connector.v1.base"] if _MOCK_VLLM_DEPS else types.SimpleNamespace()

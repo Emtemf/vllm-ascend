@@ -13,7 +13,9 @@ import torch
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm.v1.metrics import ttft_diagnostics as diag
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import ttft_diagnostics as store_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
 
 # isort: off
@@ -339,7 +341,10 @@ class KVTransferThread(threading.Thread):
         return self.block_size
 
     def add_request(self, request: Any) -> None:
-        self.request_queue.put(request)
+        if request is None or not diag.enabled():
+            self.request_queue.put(request)
+        else:
+            self.request_queue.put(store_diag.capture(self, request))
 
     def get_and_clear_finished_requests(
         self,
@@ -433,6 +438,7 @@ class KVTransferThread(threading.Thread):
         max_transfer_bytes: int,
     ) -> int:
         if len(gvas) == 0:
+            store_diag.decision("empty_copy", direction="save" if direction == 0 else "load", count=0)
             return 0
 
         # direction: 0/SMEMB_COPY_L2G = save (write), 1/SMEMB_COPY_G2L = load (read)
@@ -465,12 +471,17 @@ class KVTransferThread(threading.Thread):
                 split_gvas.tolist(),
                 split_sizes.tolist(),
             )
+            store_diag.submitted(split_sizes, len(split_gvas),
+                                 direction="save" if direction == 0 else "load", operation="batch_copy")
             res = self.m_store.store.batch_copy(
                 split_gvas.tolist(),
                 split_addrs.tolist(),
                 split_sizes.tolist(),
                 direction,
             )
+            if diag.enabled():
+                diag.emit("store_copy_result", direction="save" if direction == 0 else "load",
+                          status="returned", return_code=int(res))
             if res != 0:
                 logger.error("[KVPOOL] batch_copy %s FAILED res=%d", dir_name, res)
                 return res
@@ -497,7 +508,10 @@ class KVTransferThread(threading.Thread):
                     logger.warning("Received a None request. This indicates queue shutdown or invalid request.")
                     self.request_queue.task_done()
                     continue
-                self._handle_request(request_data)
+                if isinstance(request_data, store_diag.QueuedDiagnostic):
+                    store_diag.execute(self, request_data)
+                else:
+                    self._handle_request(request_data)
             except Exception as e:
                 self._fatal_error = e
                 logger.error(
@@ -528,8 +542,16 @@ class KVTransferThread(threading.Thread):
             exists_list = [False] * len(keys)
             for index, value in enumerate(res):  # type: ignore[arg-type]
                 exists_list[index] = value == 1
+            if diag.enabled():
+                diag.emit("store_lookup", status="returned", count=len(keys),
+                          returned_count=len(res), hit_count=sum(value == 1 for value in res),
+                          miss_count=sum(value == 0 for value in res),
+                          error_count=sum(value not in (0, 1) for value in res))
             return exists_list
         except Exception as e:
+            if diag.enabled():
+                diag.emit("store_lookup", status="error", count=len(keys),
+                          error_type=type(e).__name__, fallback="all_missing")
             logger.error(
                 "Remote connection failed in lookup. type=%s, error=%s. Check network and remote store.",
                 type(e).__name__,
@@ -596,6 +618,8 @@ class KVTransferThread(threading.Thread):
 
 
 class KVCacheStoreSendingThread(KVTransferThread):
+    diagnostic_direction = "save"
+
     def __init__(
         self,
         m_store: Backend,
@@ -656,7 +680,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
             req_id = req_meta.req_id
             try:
                 self.worker._store_kv_tp_mismatch(req_meta)
-            except Exception:
+            except Exception as exc:
+                if diag.enabled():
+                    diag.emit("store_save_error", status="error", error_type=type(exc).__name__, suppressed=True)
                 logger.exception("Failed to store KV cache for TP-mismatch request %s", req_id)
             finally:
                 remaining = self.get_stored_request_count(req_id)
@@ -675,9 +701,12 @@ class KVCacheStoreSendingThread(KVTransferThread):
             with self.done_task_lock:
                 tracked_request = req_id in self.stored_requests
             if not tracked_request:
+                store_diag.decision("request_not_tracked", count=0)
                 return
             self._handle_stored_request(req_meta)
-        except Exception:
+        except Exception as exc:
+            if diag.enabled():
+                diag.emit("store_save_error", status="error", error_type=type(exc).__name__, suppressed=True)
             logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
             remaining = self.dec_stored_request(req_id) if tracked_request else None
@@ -741,6 +770,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         group_store_mask[chunk_id] = False
                         skipped_chunks += 1
                 if skipped_chunks:
+                    if diag.enabled():
+                        store_diag.decision("pooled_chunks_skipped", group_id=group_id, count=skipped_chunks)
                     logger.debug(
                         "KV pool put skipped %d pooled chunks for request %s group %d",
                         skipped_chunks,
@@ -748,6 +779,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                         group_id,
                     )
                 if not group_store_mask or not any(group_store_mask):
+                    store_diag.decision("store_mask_empty", group_id=group_id, count=0)
                     continue
 
             starts: list[int] = []
@@ -793,6 +825,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             build_key_time += time.perf_counter() - phase_start
 
 
+            store_diag.decision("candidate_keys", group_id=group_id, count=len(keys))
             if not keys:
                 continue
             phase_start = time.perf_counter()
@@ -800,6 +833,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             lookup_time += time.perf_counter() - phase_start
             missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
             if not missing_indices:
+                store_diag.decision("all_hit", group_id=group_id, count=len(keys))
                 continue
             starts = [starts[index] for index in missing_indices]
             ends = [ends[index] for index in missing_indices]
@@ -884,6 +918,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 current_event.synchronize()
             sync_time += time.perf_counter() - phase_start
             phase_start = time.perf_counter()
+            store_diag.submitted(sizes, len(keys))
             self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
@@ -920,6 +955,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
+    diagnostic_direction = "load"
+
     def __init__(
         self,
         m_store: Backend,
@@ -1016,6 +1053,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_list.append(block_id)
             build_key_time = time.perf_counter() - build_key_start - prepare_time
             if not key_list:
+                store_diag.decision("no_keys", direction="load", count=0)
                 self.set_finished_request(req_id)
                 return
             key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
@@ -1033,6 +1071,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 key_list_c[:3],
             )
             get_start = time.perf_counter()
+            store_diag.submitted(size_list_c, len(key_list_c), direction="load", operation="get")
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
             get_time = time.perf_counter() - get_start
             result_start = time.perf_counter()
@@ -1106,6 +1145,8 @@ class KVCacheStoreRecvingThread(KVTransferThread):
 
 
 class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
+    diagnostic_direction = "save"
+
     def __init__(
         self,
         m_store: Backend,
@@ -1170,6 +1211,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         self, transfer_tasks: list[LayerTransferTask]
     ):
         if len(transfer_tasks) == 0:
+            store_diag.decision("empty_tasks", count=0)
             self.request_queue.task_done()
             return
         if len(transfer_tasks) > 1:
@@ -1245,7 +1287,12 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
             sizes_to_put = [size_list[index] for index in missing_indices]
             if keys_to_put:
                 self.sync_save_events[layer_id].synchronize()
+                store_diag.submitted(sizes_to_put, len(keys_to_put))
                 self.m_store.put(keys_to_put, addrs_to_put, sizes_to_put)
+            else:
+                store_diag.decision("all_hit", count=len(key_list))
+        else:
+            store_diag.decision("no_keys", count=0)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -1260,6 +1307,8 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
 
 
 class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+    diagnostic_direction = "load"
+
     def __init__(
         self,
         m_store: Backend,
@@ -1346,7 +1395,10 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             key_list_c = _circular_shift(key_list, shift)
             addr_list_c = _circular_shift(addr_list, shift)
             size_list_c = _circular_shift(size_list, shift)
+            store_diag.submitted(size_list_c, len(key_list_c), direction="load", operation="get")
             self.m_store.get(key_list_c, addr_list_c, size_list_c)
+        else:
+            store_diag.decision("no_keys", direction="load", count=0)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -1362,6 +1414,8 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
 
 
 class KVCacheStoreLayerSendingThread(KVTransferThread):
+    diagnostic_direction = "save"
+
     def __init__(
         self,
         m_store: Backend,
@@ -1426,6 +1480,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         # use_layerwise_transfer gate is on; every store call below sits on
         # the Backend ABC, so the thread stays backend-agnostic.
         if len(transfer_tasks) == 0:
+            store_diag.decision("empty_tasks", count=0)
             self.request_queue.task_done()
             return
         physical_layer = transfer_tasks[0].layer_id
@@ -1439,6 +1494,7 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
         for task in transfer_tasks:
             shared = task.shared_block_data
             if shared is None:
+                store_diag.decision("no_shared_blocks", group_id=task.group_id, count=0)
                 continue
             has_any_save = True
             builder = self.group_builders[task.group_id] if self.group_builders else self.layer_batch_builder
@@ -1499,6 +1555,8 @@ class KVCacheStoreLayerSendingThread(KVTransferThread):
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
+    diagnostic_direction = "load"
+
     def __init__(
         self,
         m_store: Backend,
@@ -1600,6 +1658,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             self.layer_save_finished_events[wait_for_save].clear()
 
         if len(transfer_tasks) == 0:
+            store_diag.decision("empty_tasks", direction="load", count=0)
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             assert not self.layer_load_finished_events[layer_id].is_set()
@@ -1621,6 +1680,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                 task_metas.append((task, req_meta))
 
         if not task_metas:
+            store_diag.decision("no_blocks", direction="load", count=0)
             if self.external_slot_release_waiter is not None:
                 self.external_slot_release_waiter(layer_id)
             assert not self.layer_load_finished_events[layer_id].is_set()

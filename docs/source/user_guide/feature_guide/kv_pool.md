@@ -48,6 +48,40 @@ To guarantee uniform hash generation, it is required to synchronize the PYTHONHA
 export PYTHONHASHSEED=0
 ```
 
+### Optional backend TTFT residual diagnostics
+
+Set `VLLM_TTFT_DIAGNOSTICS=1` before starting the server to enable the
+shared vLLM `[TTFT_DIAG]` records (default: disabled). These are greppable
+`key=value` text lines (one event per line, not JSON): values are single
+space-free tokens, sequences are comma-joined (`request_ids=A,B`), a missing
+value is `null` (never zero), and booleans are `true`/`false`. Store queue
+records snapshot existing request IDs, a local task ID, TP rank, layers,
+and save/load direction at submission, then restore that association in
+the transfer thread. Checks distinguish disabled saves, empty masks or
+tasks, all-hit lookups, lookup-error all-missing fallbacks, and submitted
+counts/bytes. Existing detailed timing logs retain their meaning.
+
+Mooncake native put tracing is optional. When diagnostics are on, the backend
+probes `supports_batch_put_trace()` / `batch_put_from_multi_buffers_with_trace()`
+after store setup (including lazy setup). If present, put uses the traced API
+exactly once and native `BatchPutTiming` lines carry a matching `trace_id`.
+If absent — an older/unrecompiled Mooncake, or a read-only D node that never
+puts — startup is **not** blocked: put degrades to the original API, a warning
+is logged once, and `[TTFT_DIAG]` records are tagged `native_trace=unavailable`
+so offline analysis does not try to join native lines on a trace_id that never
+existed. Only an opaque ASCII trace ID ever crosses the native boundary.
+Returned negative results, caught exceptions, and uninitialized gets are
+reported separately; a returned call is not a claim that data was saved.
+Disabled diagnostics use the original native API and enqueue the original
+payload.
+
+These are host-side boundaries without additional device synchronization.
+Layerwise batch-copy submissions are labelled save or load, not native
+Mooncake puts. Queue work, layers, ranks, and other backend stages can
+overlap: do not sum them to claim an additive TTFT total. Records omit
+prompts, addresses, and full cache keys.
+
+
 ## 2. Example of using Mooncake as a KV Pool backend
 
 ### Step 2.1: Software Installation
