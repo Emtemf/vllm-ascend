@@ -48,13 +48,14 @@ To guarantee uniform hash generation, it is required to synchronize the PYTHONHA
 export PYTHONHASHSEED=0
 ```
 
-### Optional backend TTFT residual diagnostics
+### Backend TTFT residual diagnostics (on by default)
 
-Set `VLLM_TTFT_DIAGNOSTICS=1` before starting the server to enable the
-shared vLLM `[TTFT_DIAG]` records (default: disabled). These are greppable
-`key=value` text lines (one event per line, not JSON): values are single
-space-free tokens, sequences are comma-joined (`request_ids=A,B`), a missing
-value is `null` (never zero), and booleans are `true`/`false`. Store queue
+The shared vLLM `[TTFT_DIAG]` records are emitted by default; set
+`VLLM_TTFT_DIAGNOSTICS=0` before starting the server to disable them. These
+are greppable `key=value` text lines (one event per line, not JSON): values
+are single space-free tokens, sequences are comma-joined
+(`request_ids=A,B`), a missing value is `null` (never zero), and booleans are
+`true`/`false`. Store queue
 records snapshot existing request IDs, a local task ID, TP rank, layers,
 and save/load direction at submission, then restore that association in
 the transfer thread. Checks distinguish disabled saves, empty masks or
