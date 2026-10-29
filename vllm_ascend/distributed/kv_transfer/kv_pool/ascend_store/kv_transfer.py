@@ -918,7 +918,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 current_event.synchronize()
             sync_time += time.perf_counter() - phase_start
             phase_start = time.perf_counter()
-            store_diag.submitted(sizes, len(keys))
+            store_diag.submitted(sizes, len(keys), group_id=group_id, born_step=getattr(req_meta, "born_step", -1))
+            logger.info(f"keys: {keys}, sizes: {sizes}")
             self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
@@ -937,10 +938,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             - put_time,
         )
         logger.info(
-            "[TTFT_DEBUG][AscendStoreSave] req_id=%s keys=%d bytes=%d "
+            "[TTFT_DEBUG][AscendStoreSave] req_id=%s born_step=%d keys=%d bytes=%d "
             "queue_wait=%.6f total=%.6f build_key=%.6f lookup=%.6f "
             "prepare=%.6f sync=%.6f put=%.6f other=%.6f",
             req_id,
+            getattr(req_meta, "born_step", -1),
             num_put_keys,
             num_put_bytes,
             queue_wait_time,
