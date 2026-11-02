@@ -1,4 +1,4 @@
-"""Behavioral coverage for optional Store diagnostics, without NPU work."""
+"""Behavioral coverage for compact Store diagnostics, without NPU work."""
 
 import itertools
 import queue
@@ -40,9 +40,8 @@ class Recorder:
 
     @contextmanager
     def span(self, event, **fields):
-        self.emit(event + "_start", **fields)
         try:
-            yield
+            yield fields
         except BaseException:
             self.emit(event, status="error", **fields)
             raise
@@ -67,15 +66,21 @@ class TestStoreDiagnostics(unittest.TestCase):
         thread.request_queue = queue.Queue()
         return thread
 
-    def backend(self, native_trace=True):
+    def backend(self):
         backend = object.__new__(mooncake_backend.MooncakeBackend)
         backend.store = MagicMock()
         backend._store_initialized = True
         backend._lazy_init = False
-        backend._native_trace_supported = False
         backend.config = SimpleNamespace(preferred_segment=True, prefer_alloc_in_same_node=True)
         backend.local_seg = "existing-segment"
         return backend
+
+    def run_task(self, thread, action):
+        result = []
+        thread._handle_request = lambda payload: result.append(action())
+        queued = ttft_diagnostics.capture(thread, SimpleNamespace(req_id="r"))
+        ttft_diagnostics.execute(thread, queued)
+        return result[0], self.diag.events[-1]
 
     def test_disabled_and_shutdown_preserve_payload_identity_without_capture(self):
         thread = self.thread()
@@ -116,12 +121,19 @@ class TestStoreDiagnostics(unittest.TestCase):
 
     def test_worker_exception_is_not_suppressed_and_context_is_restored(self):
         thread = self.thread()
-        thread._handle_request = MagicMock(side_effect=ValueError("worker failed"))
+
+        def fail(payload):
+            ttft_diagnostics.decision("all_hit", count=5)
+            raise ValueError("worker failed")
+
+        thread._handle_request = fail
         queued = ttft_diagnostics.capture(thread, SimpleNamespace(req_id="r"))
         with self.assertRaisesRegex(ValueError, "worker failed"):
             ttft_diagnostics.execute(thread, queued)
         self.assertEqual(self.diag.fields, {})
         self.assertEqual(self.diag.events[-1]["status"], "error")
+        _, empty = self.run_task(thread, lambda: None)
+        self.assertNotIn("all_hit_key_count", empty)
 
     def test_lookup_error_preserves_all_missing_fallback(self):
         thread = self.thread()
@@ -129,34 +141,45 @@ class TestStoreDiagnostics(unittest.TestCase):
         thread.m_store.exists.side_effect = OSError("query failed")
         self.assertEqual(kv_transfer.KVTransferThread.lookup(thread, ["a", "b"]), [False, False])
         self.assertEqual(self.diag.events[-1]["fallback"], "all_missing")
+        result, task = self.run_task(thread, lambda: kv_transfer.KVTransferThread.lookup(thread, ["a", "b"]))
+        self.assertEqual(result, [False, False])
+        self.assertEqual(task["lookup_exception_count"], 1)
+        self.assertNotIn("lookup_miss_count", task)
+        self.assertNotIn("lookup_hit_count", task)
         thread.m_store.exists.side_effect = None
         thread.m_store.exists.return_value = [1, 1]
+        before = len(self.diag.events)
         self.assertEqual(kv_transfer.KVTransferThread.lookup(thread, ["a", "b"]), [True, True])
-        self.assertEqual(self.diag.events[-1]["hit_count"], 2)
+        self.assertEqual(len(self.diag.events), before)
+        result, task = self.run_task(thread, lambda: kv_transfer.KVTransferThread.lookup(thread, ["a", "b"]))
+        self.assertEqual(result, [True, True])
+        self.assertEqual(task["lookup_hit_count"], 2)
 
     def test_lookup_reports_negative_states_without_reclassifying_as_misses(self):
         thread = self.thread()
         thread.m_store = MagicMock()
         thread.m_store.exists.return_value = [-1, 1, 0]
-        self.assertEqual(kv_transfer.KVTransferThread.lookup(thread, ["a", "b", "c"]), [False, True, False])
-        result = self.diag.events[-1]
-        self.assertEqual(result["count"], 3)
-        self.assertEqual(result["returned_count"], 3)
-        self.assertEqual(result["hit_count"], 1)
-        self.assertEqual(result["miss_count"], 1)
-        self.assertEqual(result["error_count"], 1)
+        result, task = self.run_task(thread, lambda: kv_transfer.KVTransferThread.lookup(thread, ["a", "b", "c"]))
+        self.assertEqual(result, [False, True, False])
+        self.assertEqual(task["lookup_key_count"], 3)
+        self.assertEqual(task["lookup_returned_count"], 3)
+        self.assertEqual(task["lookup_hit_count"], 1)
+        self.assertEqual(task["lookup_miss_count"], 1)
+        self.assertEqual(task["lookup_error_count"], 1)
+        error = next(event for event in self.diag.events if event["event"] == "store_lookup")
+        self.assertEqual(error["status"], "error")
 
     def test_lookup_short_result_preserves_baseline_false_padding_without_claiming_misses(self):
         thread = self.thread()
         thread.m_store = MagicMock()
         thread.m_store.exists.return_value = [1]
-        self.assertEqual(kv_transfer.KVTransferThread.lookup(thread, ["a", "b", "c"]), [True, False, False])
-        result = self.diag.events[-1]
-        self.assertEqual(result["count"], 3)
-        self.assertEqual(result["returned_count"], 1)
-        self.assertEqual(result["hit_count"], 1)
-        self.assertEqual(result["miss_count"], 0)
-        self.assertEqual(result["error_count"], 0)
+        result, task = self.run_task(thread, lambda: kv_transfer.KVTransferThread.lookup(thread, ["a", "b", "c"]))
+        self.assertEqual(result, [True, False, False])
+        self.assertEqual(task["lookup_key_count"], 3)
+        self.assertEqual(task["lookup_returned_count"], 1)
+        self.assertEqual(task["lookup_hit_count"], 1)
+        self.assertEqual(task["lookup_miss_count"], 0)
+        self.assertEqual(task["lookup_error_count"], 0)
 
     def test_disabled_put_keeps_original_call_and_caught_error(self):
         backend = self.backend()
@@ -167,7 +190,7 @@ class TestStoreDiagnostics(unittest.TestCase):
         backend.store.batch_put_from_multi_buffers_with_trace.assert_not_called()
         self.assertEqual(self.diag.events, [])
 
-    def test_put_uses_original_call_once_and_reports_result(self):
+    def test_put_uses_original_call_once_and_preserves_failure_outcome(self):
         # The traced put API was removed: diagnostics must record the same
         # original batch_put_from_multi_buffers call without altering it.
         backend = self.backend()
@@ -182,8 +205,50 @@ class TestStoreDiagnostics(unittest.TestCase):
         self.assertTrue(call.args[3].prefer_alloc_in_same_node)
         result = next(event for event in self.diag.events if event["event"] == "store_backend_put_result")
         self.assertEqual(result["failed_count"], 1)
+        completion = next(event for event in self.diag.events if event["event"] == "store_backend_put")
+        self.assertEqual(completion["count"], 2)
+        self.assertEqual(completion["bytes"], 16)
+        self.assertEqual(completion["returned_count"], 2)
+        self.assertEqual(completion["failed_count"], 1)
         self.assertNotIn("trace_id", result)
         self.assertNotIn("k1", repr(self.diag.events))
+
+    def test_successful_put_emits_one_completion_without_result_event(self):
+        backend = self.backend()
+        backend.store.batch_put_from_multi_buffers.return_value = [0]
+        backend.put(["k"], [[1]], [[8]])
+        backend.store.batch_put_from_multi_buffers.assert_called_once()
+        self.assertEqual([event["event"] for event in self.diag.events], ["store_backend_put"])
+        self.assertEqual(self.diag.events[0]["returned_count"], 1)
+        self.assertEqual(self.diag.events[0]["failed_count"], 0)
+
+    def test_task_aggregates_groups_and_resets_without_detached_success_events(self):
+        thread = self.thread()
+        thread.m_store = MagicMock()
+        thread.m_store.exists.return_value = [1, 0]
+
+        def action():
+            for group_id in range(3):
+                ttft_diagnostics.decision("candidate_keys", group_id=group_id, count=2)
+                kv_transfer.KVTransferThread.lookup(thread, ["a", "b"])
+                ttft_diagnostics.submitted([[8, 16]], 1)
+
+        _, task = self.run_task(thread, action)
+        self.assertEqual([event["event"] for event in self.diag.events], ["store_task"])
+        self.assertEqual(task["candidate_key_count"], 6)
+        self.assertEqual(task["lookup_count"], 3)
+        self.assertEqual(task["lookup_hit_count"], 3)
+        self.assertEqual(task["lookup_miss_count"], 3)
+        self.assertEqual(task["submitted_key_count"], 3)
+        self.assertEqual(task["submitted_bytes"], 72)
+        self.assertEqual(task["queue_wait_ns"], task["dequeued_ns"] - task["enqueued_ns"])
+        self.assertNotIn("group_id", task)
+        before = len(self.diag.events)
+        ttft_diagnostics.decision("all_hit", count=999)
+        ttft_diagnostics.submitted([[999]], 1)
+        self.assertEqual(len(self.diag.events), before)
+        _, empty = self.run_task(thread, lambda: None)
+        self.assertFalse(any(key.startswith(("lookup_", "submitted_", "check_")) for key in empty))
 
     def test_get_reports_not_executed_and_suppressed_exception(self):
         backend = self.backend()

@@ -345,7 +345,11 @@ class KVTransferThread(threading.Thread):
         if request is None or not diag.enabled():
             self.request_queue.put(request)
         else:
-            self.request_queue.put(store_diag.capture(self, request))
+            try:
+                queued = store_diag.capture(self, request)
+            except Exception:
+                queued = request
+            self.request_queue.put(queued)
 
     def get_and_clear_finished_requests(
         self,
@@ -480,10 +484,10 @@ class KVTransferThread(threading.Thread):
                 split_sizes.tolist(),
                 direction,
             )
-            if diag.enabled():
-                diag.emit("store_copy_result", direction="save" if direction == 0 else "load",
-                          status="returned", return_code=int(res))
             if res != 0:
+                if diag.enabled():
+                    diag.emit("store_copy_result", direction="save" if direction == 0 else "load",
+                              status="error", return_code=int(res))
                 logger.error("[KVPOOL] batch_copy %s FAILED res=%d", dir_name, res)
                 return res
         return 0
@@ -550,16 +554,10 @@ class KVTransferThread(threading.Thread):
             exists_list = [False] * len(keys)
             for index, value in enumerate(res):  # type: ignore[arg-type]
                 exists_list[index] = value == 1
-            if diag.enabled():
-                diag.emit("store_lookup", status="returned", count=len(keys),
-                          returned_count=len(res), hit_count=sum(value == 1 for value in res),
-                          miss_count=sum(value == 0 for value in res),
-                          error_count=sum(value not in (0, 1) for value in res))
+            store_diag.lookup_result(keys, res)
             return exists_list
         except Exception as e:
-            if diag.enabled():
-                diag.emit("store_lookup", status="error", count=len(keys),
-                          error_type=type(e).__name__, fallback="all_missing")
+            store_diag.lookup_result(keys, error=e)
             logger.error(
                 "Remote connection failed in lookup. type=%s, error=%s. Check network and remote store.",
                 type(e).__name__,
@@ -690,7 +688,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 self.worker._store_kv_tp_mismatch(req_meta)
             except Exception as exc:
                 if diag.enabled():
-                    diag.emit("store_save_error", status="error", error_type=type(exc).__name__, suppressed=True)
+                    store_diag.failure(
+                        "store_save_error", status="error", error_type=type(exc).__name__, suppressed=True
+                    )
                 logger.exception("Failed to store KV cache for TP-mismatch request %s", req_id)
             finally:
                 remaining = self.get_stored_request_count(req_id)
@@ -714,7 +714,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             self._handle_stored_request(req_meta)
         except Exception as exc:
             if diag.enabled():
-                diag.emit("store_save_error", status="error", error_type=type(exc).__name__, suppressed=True)
+                store_diag.failure("store_save_error", status="error", error_type=type(exc).__name__, suppressed=True)
             logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
             remaining = self.dec_stored_request(req_id) if tracked_request else None
@@ -929,14 +929,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             phase_start = time.perf_counter()
             store_diag.submitted(sizes, len(keys))
             logger.info("keys:%s, sizes:%s", keys, sizes)
-            with (
-                diag.scope(group_id=group_id),
-                diag.span(
-                    "store_put",
-                    count=len(keys),
-                    bytes=sum(sum(s) if isinstance(s, list) else s for s in sizes),
-                ),
-            ):
+            with diag.scope(group_id=group_id):
                 self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
@@ -1300,6 +1293,7 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
         for req_id in req_ids:
             self.dec_stored_request(req_id)
 
+        store_diag.decision("candidate_keys", count=len(key_list))
         if key_list:
             exists_states = self.lookup(key_list)
             missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
@@ -1309,7 +1303,8 @@ class KVCacheStoreKeyLayerSendingThread(KVTransferThread):
             if keys_to_put:
                 self.sync_save_events[layer_id].synchronize()
                 store_diag.submitted(sizes_to_put, len(keys_to_put))
-                self.m_store.put(keys_to_put, addrs_to_put, sizes_to_put)
+                with diag.scope(group_id=transfer_task.group_id):
+                    self.m_store.put(keys_to_put, addrs_to_put, sizes_to_put)
             else:
                 store_diag.decision("all_hit", count=len(key_list))
         else:

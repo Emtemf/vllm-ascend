@@ -54,22 +54,39 @@ The shared vLLM `[TTFT_DIAG]` records are emitted unconditionally.
 These are greppable `key=value` text lines (one event per line, not JSON): values
 are single space-free tokens, sequences are comma-joined
 (`request_ids=A,B`), a missing value is `null` (never zero), and booleans are
-`true`/`false`. Store queue
-records snapshot existing request IDs, a local task ID, TP rank, layers,
-and save/load direction at submission, then restore that association in
-the transfer thread. Checks distinguish disabled saves, empty masks or
-tasks, all-hit lookups, lookup-error all-missing fallbacks, and submitted
-counts/bytes. Existing detailed timing logs retain their meaning.
+`true`/`false`. Store submissions snapshot existing request IDs, a local
+task ID, execution ID, TP rank, layers, and save/load direction, then restore
+that association in the transfer thread. One `store_task` completion carries
+`enqueued_ns`, `dequeued_ns`, and `queue_wait_ns` instead of separate queue
+events. Fixed-size counters aggregate checks (`check_all_hit_count`, for
+example), candidate/all-hit keys, and submitted keys/bytes across groups.
+They do not collect per-group arrays or dynamically named group counters.
+Lookup totals (`lookup_count`, `lookup_key_count`, and observed returned,
+hit/miss/error counts) appear only when a lookup actually occurs; absent
+lookup fields are unknown, not zero. Lookup exceptions retain the explicit
+all-missing fallback event and `lookup_exception_count`. Batch-copy and get
+submission totals use `copy_submitted_*` and `get_submitted_*`, separately
+from put `submitted_*` totals. Existing detailed timing logs retain their
+meaning, including the all-step/all-TP first timing table.
 
 Mooncake puts use the original `batch_put_from_multi_buffers` API.
 No native trace API is probed and no trace ID crosses the native boundary.
 `[TTFT_THREAD]` maps the transfer thread's native TID to its Worker PID and
-TP rank. Backend put spans inherit the task, execution, native TID and cache
-group identity. Offline reports associate native `BatchPutTiming` records
-only through a unique thread mapping and matching put interval, with
-keys/bytes reconciliation; missing identity remains unassociated.
-Returned negative results, caught exceptions, and uninitialized gets are
-reported separately; a returned call is not a claim that data was saved.
+TP rank. Backend put completions inherit task, execution and cache group
+identity. Spans emit completion only with `compact=true`, `start_ns`,
+`end_ns`, `duration_ns`, `start_wall_ns`, and `start_native_tid`; `wall_ns`
+is still the completion emission timestamp, and `native_tid` is always the
+actual emitting thread. Each `store_backend_put` completion carries its
+interval, submitted key count/bytes and observed returned/failed counts,
+without a redundant successful result event or outer `store_put` span.
+Offline reports associate native `BatchPutTiming` records only through a
+unique thread mapping and matching put interval, with keys/bytes
+reconciliation; missing identity remains unassociated. Returned negative
+results, caught exceptions, and uninitialized gets retain explicit error
+events; a returned call is not a claim that data was saved. Normal checks,
+lookups, submissions and successful copy/get results do not emit individual
+records. Aggregation is task-local and reset even when processing raises;
+diagnostic helpers outside a task do not create detached success records.
 
 These are host-side boundaries without additional device synchronization.
 Layerwise batch-copy submissions are labelled save or load, not native

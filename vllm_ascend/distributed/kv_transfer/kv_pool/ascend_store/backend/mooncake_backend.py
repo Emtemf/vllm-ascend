@@ -17,6 +17,7 @@ from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 from vllm.v1.metrics import ttft_diagnostics as diag
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import ttft_diagnostics as store_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
 from vllm_ascend.distributed.parallel_state import get_global_rank
@@ -205,21 +206,21 @@ class MooncakeBackend(Backend):
             if diag.enabled():
                 with diag.span(
                     "store_backend_put", direction="save", count=len(keys),
-                    bytes=sum(sum(size) for size in sizes),
-                ):
+                    bytes=store_diag.byte_count(sizes),
+                ) as fields:
                     native_called = True
                     res = self.store.batch_put_from_multi_buffers(
                         keys, addrs, sizes, config
                     )
-                diag.emit(
-                    "store_backend_put_result", direction="save", status="returned",
-                    returned_count=len(res), failed_count=sum(value < 0 for value in res),
-                )
+                    store_diag.backend_result(fields, res)
             else:
                 res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
+                if diag.enabled():
+                    diag.emit("store_backend_put_result", direction="save", status="error",
+                              returned_count=len(res), failed_count=failed_count)
                 error_codes = sorted(set(failed_codes))
                 logger.error(
                     "Failed to put %d keys out of %d. error_codes=%s. Check memory and store capacity.",
@@ -269,19 +270,20 @@ class MooncakeBackend(Backend):
         try:
             if diag.enabled():
                 with diag.span("store_backend_get", direction="load", count=len(keys),
-                               bytes=sum(sum(size) for size in sizes)):
+                               bytes=store_diag.byte_count(sizes)) as fields:
                     native_called = True
                     res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+                    store_diag.backend_result(fields, res)
             else:
                 res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
             res_list = list(res)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             error_codes = sorted(set(failed_codes))
-            if diag.enabled():
-                diag.emit("store_backend_get_result", direction="load", status="returned",
-                          returned_count=len(res_list), failed_count=failed_count)
             if failed_count:
+                if diag.enabled():
+                    diag.emit("store_backend_get_result", direction="load", status="error",
+                              returned_count=len(res_list), failed_count=failed_count)
                 logger.error(
                     "Failed to get %d keys out of %d. error_codes=%s. Check key existence and memory state.",
                     failed_count,
