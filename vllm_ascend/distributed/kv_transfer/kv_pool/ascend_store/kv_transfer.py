@@ -928,6 +928,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             sync_time += time.perf_counter() - phase_start
             phase_start = time.perf_counter()
             store_diag.submitted(sizes, len(keys))
+            logger.info("keys:%s, sizes:%s", keys, sizes)
             with (
                 diag.scope(group_id=group_id),
                 diag.span(

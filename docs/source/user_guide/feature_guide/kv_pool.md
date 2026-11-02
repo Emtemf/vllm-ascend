@@ -74,8 +74,11 @@ reported separately; a returned call is not a claim that data was saved.
 These are host-side boundaries without additional device synchronization.
 Layerwise batch-copy submissions are labelled save or load, not native
 Mooncake puts. Queue work, layers, ranks, and other backend stages can
-overlap: do not sum them to claim an additive TTFT total. Records omit
-prompts, addresses, and full cache keys.
+overlap: do not sum them to claim an additive TTFT total. Structured diagnostic
+records omit prompts, addresses, and full cache keys. The separate legacy
+`keys:..., sizes:...` INFO log retains full cache keys and buffer sizes for
+v0.23 comparisons; its logging overhead is included in the save task's `put`
+timer. Treat those raw logs as sensitive.
 
 Report save timings and data volume for one explicitly selected TP (TP0 by
 default). Native phases may be accumulated across serial calls on that TP,
