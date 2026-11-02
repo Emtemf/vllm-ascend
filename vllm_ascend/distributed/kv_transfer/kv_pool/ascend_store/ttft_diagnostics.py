@@ -1,5 +1,6 @@
 """Opt-in Store diagnostics; payloads and transfer bookkeeping stay caller-owned."""
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +34,8 @@ def capture(thread: Any, payload: Any) -> QueuedDiagnostic:
     fields = (
         ("request_ids", tuple(dict.fromkeys(request_ids))),
         ("task_id", diag.new_id("store_task")),
+        ("execution_id", getattr(payload, "execution_id", "")
+         or diag.current().get("execution_id", "")),
         ("tp_rank", thread.tp_rank),
         ("layer_ids", tuple(dict.fromkeys(layer_ids))),
         ("direction", getattr(thread, "diagnostic_direction", "unknown")),
@@ -44,7 +47,7 @@ def capture(thread: Any, payload: Any) -> QueuedDiagnostic:
 
 
 def execute(thread: Any, queued: QueuedDiagnostic) -> None:
-    with diag.scope(**dict(queued.fields)):
+    with diag.scope(**dict(queued.fields), native_tid=threading.get_native_id()):
         diag.emit("store_dequeue", queue_wait_ns=time.monotonic_ns() - queued.enqueued_ns)
         with diag.span("store_task"):
             thread._handle_request(queued.payload)

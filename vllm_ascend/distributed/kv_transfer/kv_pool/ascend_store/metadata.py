@@ -770,8 +770,6 @@ class RequestTracker:
 
     block_sizes: list[int] | None = None
 
-    # How many save-metas this tracker has produced (= born_step of next meta)
-    save_count: int = 0
 
     def __init__(
         self,
@@ -886,7 +884,7 @@ class ReqMeta:
     kv_cache_group_ids: list[int] | None = None
     skip_null_blocks_by_group: list[bool] | None = None
     num_prompt_tokens: int | None = None
-    born_step: int = -1
+    execution_id: str = ""
 
     # The following parameters are only used for kv event generation
     # TODO: add lora_request which used for gen lora_id/lora_name in kv event
@@ -927,7 +925,7 @@ class ReqMeta:
         load_gva_block_offset: int = 0,
         partial_save_gva_per_group: list[int] | None = None,
         partial_load_gva_per_group: list[int] | None = None,
-        born_step: int = -1,
+        execution_id: str = "",
     ) -> None:
         if token_len_chunk is None:
             token_len_chunk = 0 if save_end_token is None else save_end_token
@@ -952,9 +950,7 @@ class ReqMeta:
         self.token_ids = token_ids
         self.original_block_size = original_block_size
         self.event_id = event_id
-        # born_step: how many save-metas this request had already produced
-        # when this one was built (from RequestTracker.save_count).
-        self.born_step = born_step
+        self.execution_id = execution_id
         self.last_block_gva = last_block_gva
         self.partial_block_index = partial_block_index
         self.block_ids_np = block_ids_np
@@ -1087,7 +1083,6 @@ class ReqMeta:
             is_last_chunk=is_last_chunk,
             token_ids=token_ids,
             num_prompt_tokens=tracker.num_prompt_tokens or target_token_len,
-            born_step=tracker.save_count,
             original_block_size=original_block_size,
             last_block_gva=tracker.last_block_gva,
             partial_block_index=partial_block_index,
@@ -1102,7 +1097,6 @@ class ReqMeta:
             gva_block_offset=tracker.gva_block_offset,
             kv_cache_group_ids=list(range(len(tracker.allocated_block_ids_by_group))),
         )
-        tracker.save_count += 1
 
 
 class AscendConnectorMetadata(KVConnectorMetadata):
@@ -1111,14 +1105,17 @@ class AscendConnectorMetadata(KVConnectorMetadata):
         preempted_req_ids,
         loading_req_ids: set[str] | None = None,
         delayed_free_req_ids: set[str] | None = None,
+        execution_id: str = "",
     ):
         self.requests: list[ReqMeta] = []
         self.preempted_req_ids = preempted_req_ids
         self.loading_req_ids = loading_req_ids or set()
         self.delayed_free_req_ids = delayed_free_req_ids or set()
+        self.execution_id = execution_id
 
     def add_request(self, req_meta: ReqMeta) -> None:
         """Add a request to the metadata."""
+        req_meta.execution_id = self.execution_id
         self.requests.append(req_meta)
 
 

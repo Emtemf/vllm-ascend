@@ -75,10 +75,6 @@ class MooncakeBackend(Backend):
         self._contribute_memory = contribute_memory
         self._store_initialized = False
         self._store_init_lock = threading.Lock()
-        # Set by _setup_store when diagnostics are on: True only if this Mooncake
-        # client exposes the traced put API. False => put degrades to the original
-        # API (Python-side logs still emit, native lines carry no trace_id).
-        self._native_trace_supported = False
 
         if not self._lazy_init:
             self.store = self._setup_store()
@@ -168,22 +164,6 @@ class MooncakeBackend(Backend):
                 self.config.ssd_offload_path,
             )
         logger.info("Mooncake tenant_id=%s", self.config.tenant_id)
-        if diag.enabled():
-            # Probe the optional traced-put API. Absent (older/unrecompiled
-            # Mooncake, or a read-only D node) => degrade, do not fail startup.
-            capability = getattr(store, "supports_batch_put_trace", None)
-            traced_put = getattr(store, "batch_put_from_multi_buffers_with_trace", None)
-            self._native_trace_supported = bool(
-                callable(capability) and callable(traced_put) and capability()
-            )
-            if not self._native_trace_supported:
-                logger.warning(
-                    "TTFT diagnostics enabled but this Mooncake client lacks "
-                    "supports_batch_put_trace()/batch_put_from_multi_buffers_with_trace(); "
-                    "put falls back to the original API. Python-side [TTFT_DIAG] logs "
-                    "still emit, but native BatchPutTiming lines carry no trace_id. "
-                    "Rebuild Mooncake with the trace API to link native put phases."
-                )
         return store
 
     @classmethod
@@ -223,28 +203,18 @@ class MooncakeBackend(Backend):
                 config.preferred_segment = self.local_seg
             config.prefer_alloc_in_same_node = self.config.prefer_alloc_in_same_node
             if diag.enabled():
-                traced = self._native_trace_supported
-                trace_id = diag.new_id("put") if traced else None
-                native_trace = "linked" if traced else "unavailable"
-                scope_fields = {"trace_id": trace_id} if traced else {}
-                with diag.scope(**scope_fields):
-                    with diag.span("store_backend_put", direction="save", count=len(keys),
-                                   bytes=sum(sum(size) for size in sizes),
-                                   native_trace=native_trace):
-                        native_called = True
-                        if traced:
-                            res = self.store.batch_put_from_multi_buffers_with_trace(
-                                keys, addrs, sizes, config, trace_id
-                            )
-                        else:
-                            # Degrade: original API; Python logs still emitted, but
-                            # native BatchPutTiming lines carry no trace_id to join on.
-                            res = self.store.batch_put_from_multi_buffers(
-                                keys, addrs, sizes, config
-                            )
-                    diag.emit("store_backend_put_result", direction="save", status="returned",
-                              native_trace=native_trace,
-                              returned_count=len(res), failed_count=sum(value < 0 for value in res))
+                with diag.span(
+                    "store_backend_put", direction="save", count=len(keys),
+                    bytes=sum(sum(size) for size in sizes),
+                ):
+                    native_called = True
+                    res = self.store.batch_put_from_multi_buffers(
+                        keys, addrs, sizes, config
+                    )
+                diag.emit(
+                    "store_backend_put_result", direction="save", status="returned",
+                    returned_count=len(res), failed_count=sum(value < 0 for value in res),
+                )
             else:
                 res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
             failed_codes = [int(value) for value in res if value < 0]

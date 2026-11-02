@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import queue
 import threading
 import time
@@ -499,6 +500,13 @@ class KVTransferThread(threading.Thread):
         """Run the thread to handle KV cache transfer requests."""
         self._set_os_thread_name()
         self.m_store.set_device()
+        logger.info(
+            "[TTFT_THREAD] pid=%d native_tid=%d tp_rank=%d direction=%s",
+            os.getpid(),
+            threading.get_native_id(),
+            self.tp_rank,
+            getattr(self, "diagnostic_direction", "unknown"),
+        )
         self.ready_event.set()
         while True:
             request_data = None
@@ -721,6 +729,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
     def _handle_stored_request(self, req_meta: ReqMeta):
         """Store missing KV chunks for one request."""
         handle_start = time.perf_counter()
+        association = diag.current()
         token_len = req_meta.token_len_chunk
         req_id = req_meta.req_id
         current_event = req_meta.current_event
@@ -918,9 +927,16 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 current_event.synchronize()
             sync_time += time.perf_counter() - phase_start
             phase_start = time.perf_counter()
-            store_diag.submitted(sizes, len(keys), group_id=group_id, born_step=getattr(req_meta, "born_step", -1))
-            logger.info(f"keys: {keys}, sizes: {sizes}")
-            self.m_store.put(keys, addrs, sizes)
+            store_diag.submitted(sizes, len(keys))
+            with (
+                diag.scope(group_id=group_id),
+                diag.span(
+                    "store_put",
+                    count=len(keys),
+                    bytes=sum(sum(s) if isinstance(s, list) else s for s in sizes),
+                ),
+            ):
+                self.m_store.put(keys, addrs, sizes)
             put_time += time.perf_counter() - phase_start
             num_put_keys += len(keys)
             num_put_bytes += sum(sum(s) if isinstance(s, list) else s for s in sizes)
@@ -938,11 +954,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             - put_time,
         )
         logger.info(
-            "[TTFT_DEBUG][AscendStoreSave] req_id=%s born_step=%d keys=%d bytes=%d "
+            "[TTFT_DEBUG][AscendStoreSave] req_id=%s execution_id=%s task_id=%s tp_rank=%d keys=%d bytes=%d "
             "queue_wait=%.6f total=%.6f build_key=%.6f lookup=%.6f "
             "prepare=%.6f sync=%.6f put=%.6f other=%.6f",
             req_id,
-            getattr(req_meta, "born_step", -1),
+            req_meta.execution_id,
+            association.get("task_id", ""),
+            self.tp_rank,
             num_put_keys,
             num_put_bytes,
             queue_wait_time,

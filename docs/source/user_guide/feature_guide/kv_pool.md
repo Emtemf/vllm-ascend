@@ -48,11 +48,10 @@ To guarantee uniform hash generation, it is required to synchronize the PYTHONHA
 export PYTHONHASHSEED=0
 ```
 
-### Backend TTFT residual diagnostics (on by default)
+### Backend TTFT residual diagnostics
 
-The shared vLLM `[TTFT_DIAG]` records are emitted by default; set
-`VLLM_TTFT_DIAGNOSTICS=0` before starting the server to disable them. These
-are greppable `key=value` text lines (one event per line, not JSON): values
+The shared vLLM `[TTFT_DIAG]` records are emitted unconditionally.
+These are greppable `key=value` text lines (one event per line, not JSON): values
 are single space-free tokens, sequences are comma-joined
 (`request_ids=A,B`), a missing value is `null` (never zero), and booleans are
 `true`/`false`. Store queue
@@ -62,25 +61,28 @@ the transfer thread. Checks distinguish disabled saves, empty masks or
 tasks, all-hit lookups, lookup-error all-missing fallbacks, and submitted
 counts/bytes. Existing detailed timing logs retain their meaning.
 
-Mooncake native put tracing is optional. When diagnostics are on, the backend
-probes `supports_batch_put_trace()` / `batch_put_from_multi_buffers_with_trace()`
-after store setup (including lazy setup). If present, put uses the traced API
-exactly once and native `BatchPutTiming` lines carry a matching `trace_id`.
-If absent — an older/unrecompiled Mooncake, or a read-only D node that never
-puts — startup is **not** blocked: put degrades to the original API, a warning
-is logged once, and `[TTFT_DIAG]` records are tagged `native_trace=unavailable`
-so offline analysis does not try to join native lines on a trace_id that never
-existed. Only an opaque ASCII trace ID ever crosses the native boundary.
+Mooncake puts use the original `batch_put_from_multi_buffers` API.
+No native trace API is probed and no trace ID crosses the native boundary.
+`[TTFT_THREAD]` maps the transfer thread's native TID to its Worker PID and
+TP rank. Backend put spans inherit the task, execution, native TID and cache
+group identity. Offline reports associate native `BatchPutTiming` records
+only through a unique thread mapping and matching put interval, with
+keys/bytes reconciliation; missing identity remains unassociated.
 Returned negative results, caught exceptions, and uninitialized gets are
 reported separately; a returned call is not a claim that data was saved.
-Disabled diagnostics use the original native API and enqueue the original
-payload.
 
 These are host-side boundaries without additional device synchronization.
 Layerwise batch-copy submissions are labelled save or load, not native
 Mooncake puts. Queue work, layers, ranks, and other backend stages can
 overlap: do not sum them to claim an additive TTFT total. Records omit
 prompts, addresses, and full cache keys.
+
+Report save timings and data volume for one explicitly selected TP (TP0 by
+default). Native phases may be accumulated across serial calls on that TP,
+not across parallel TP workers as request latency. The request's
+`BREAKDOWN.save_kv` accumulates EngineCore save values across prefill steps.
+An empty save may still have nonzero enqueue overhead; do not round it to
+zero to identify a no-task call.
 
 
 ## 2. Example of using Mooncake as a KV Pool backend

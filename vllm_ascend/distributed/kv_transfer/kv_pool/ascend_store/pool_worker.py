@@ -1887,9 +1887,11 @@ class KVPoolWorker:
             send_thread.request_queue.join()
             join_time = time.perf_counter() - join_start
         logger.info(
-            "[TTFT_DEBUG][AscendStoreSave] req_ids=%s wait_for_save=%.6f "
+            "[TTFT_DEBUG][AscendStoreSave] req_ids=%s execution_id=%s tp_rank=%d wait_for_save=%.6f "
             "enqueue=%.6f join=%.6f",
             req_ids,
+            connector_metadata.execution_id,
+            self.tp_rank,
             time.perf_counter() - ttft_start,
             enqueue_time,
             join_time,

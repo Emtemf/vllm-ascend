@@ -843,6 +843,7 @@ class KVPoolScheduler:
             scheduler_output.preempted_req_ids,
             self._loading_req_ids.copy(),
             self._delayed_free_req_ids.copy(),
+            execution_id=scheduler_output.ttft_execution_id,
         )
 
         for request in scheduler_output.scheduled_new_reqs:
