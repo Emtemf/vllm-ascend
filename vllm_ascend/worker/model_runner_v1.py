@@ -23,7 +23,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from functools import partial
@@ -83,6 +83,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -2381,56 +2382,112 @@ class NPUModelRunner(GPUModelRunner):
             get_pp_group().is_last_rank or self.broadcast_pp_output
         )
         active_device_metadata_executor = self._prepare_device_metadata_for_forward(cudagraph_mode)
-        with (
-            record_function_or_nullcontext("forward"),
-            set_ascend_forward_context(
-                attn_metadata,
-                self.vllm_config,
-                num_tokens=num_tokens_padded,
-                num_tokens_across_dp=num_tokens_across_dp,
-                aclgraph_runtime_mode=cudagraph_mode,
-                batch_descriptor=batch_desc,
-                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                model_instance=self.model,
-                device_metadata_executor=active_device_metadata_executor,
-                skip_compiled=has_encoder_input,
-                has_sinks=self._has_sinks,
-                eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
-            ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output,
-                **(
-                    {"defer_finalize": defer_kv_connector_finalize}
+        forward_timing = None
+        if ttft_diag.enabled():
+            with suppress(Exception):
+                forward_timing = {
+                    **ttft_diag.batch_fields(scheduler_output),
+                    "tp_rank": self.tp_rank,
+                    "forward": None,
+                    "model_call_pre": None,
+                    "model_call": None,
+                    "model_call_post": None,
+                    "model_prepare": None,
+                    "model_graph_update": None,
+                    "model_run": None,
+                    "branch": "graph_update_before_run" if self.enable_enpu else "graph_update_after_run",
+                    "status": "ok",
+                    "failed_stage": None,
+                    "model_forward_status": "unavailable",
+                    "graph_mode": None,
+                    "capturing": None,
+                }
+        forward_body_entered = False
+        forward_context_completed = False
+        try:
+            with (
+                record_function_or_nullcontext("forward"),
+                set_ascend_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens_padded,
+                    num_tokens_across_dp=num_tokens_across_dp,
+                    aclgraph_runtime_mode=cudagraph_mode,
+                    batch_descriptor=batch_desc,
+                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                    model_instance=self.model,
+                    device_metadata_executor=active_device_metadata_executor,
+                    skip_compiled=has_encoder_input,
+                    has_sinks=self._has_sinks,
+                    eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
                 ),
-            ) as kv_connector_output,
-        ):
-            # Mamba state copy must run AFTER the KV transfer load finishes,
-            # otherwise the copy would race with in-flight layerwise loads and
-            # read half-loaded state. With a layerwise-capable connector we
-            # defer the copy: prepare_mamba_state_copy stages per-layer copy
-            # metadata here, and each layer's copy is executed right after its
-            # own KV load completes (wait_for_layer_load), overlapping the copy
-            # with the remaining layers' loads. Non-layerwise connectors keep
-            # the batched copy after all loads finish (do_mamba_copy_block).
-            mamba_copy_connector = None
-            if self.cache_config.mamba_cache_mode == "align":
-                if has_kv_transfer_group():
-                    connector = get_kv_transfer_group()
-                    prepare_mamba_state_copy = getattr(
-                        connector,
-                        "prepare_mamba_state_copy",
-                        None,
+                self.maybe_get_kv_connector_output(
+                    scheduler_output,
+                    **(
+                        {"defer_finalize": defer_kv_connector_finalize}
+                    ),
+                ) as kv_connector_output,
+            ):
+                forward_body_entered = True
+                with ttft_diag.measure_elapsed(forward_timing, "model_call_pre"):
+                    # Mamba state copy must run AFTER the KV transfer load finishes,
+                    # otherwise the copy would race with in-flight layerwise loads and
+                    # read half-loaded state. With a layerwise-capable connector we
+                    # defer the copy: prepare_mamba_state_copy stages per-layer copy
+                    # metadata here, and each layer's copy is executed right after its
+                    # own KV load completes (wait_for_layer_load), overlapping the copy
+                    # with the remaining layers' loads. Non-layerwise connectors keep
+                    # the batched copy after all loads finish (do_mamba_copy_block).
+                    mamba_copy_connector = None
+                    if self.cache_config.mamba_cache_mode == "align":
+                        if has_kv_transfer_group():
+                            connector = get_kv_transfer_group()
+                            prepare_mamba_state_copy = getattr(
+                                connector,
+                                "prepare_mamba_state_copy",
+                                None,
+                            )
+                            if callable(prepare_mamba_state_copy) and prepare_mamba_state_copy(preprocess_bufs):
+                                mamba_copy_connector = connector
+                        if mamba_copy_connector is None:
+                            mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                with ttft_diag.measure_elapsed(forward_timing, "model_call"):
+                    hidden_states = self._model_forward(
+                        num_tokens_padded,
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                        _ttft_forward_timing=forward_timing,
+                        **model_kwargs,
                     )
-                    if callable(prepare_mamba_state_copy) and prepare_mamba_state_copy(preprocess_bufs):
-                        mamba_copy_connector = connector
-                if mamba_copy_connector is None:
-                    mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-            )
-            # Verify every scheduled layer executed its deferred copy.
-            if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
-                mamba_copy_connector.finish_mamba_state_copy()
+                with ttft_diag.measure_elapsed(forward_timing, "model_call_post"):
+                    # Verify every scheduled layer executed its deferred copy.
+                    if self.cache_config.mamba_cache_mode == "align" and mamba_copy_connector is not None:
+                        mamba_copy_connector.finish_mamba_state_copy()
+            forward_context_completed = True
+        except BaseException:
+            if forward_timing is not None:
+                forward_timing["status"] = "error"
+                if forward_timing["failed_stage"] is None:
+                    forward_timing["failed_stage"] = "context_exit"
+            raise
+        finally:
+            if forward_body_entered and forward_timing is not None:
+                try:
+                    parent_forward = getattr(kv_connector_output, "worker_forward_time", None)
+                    # Failed connector finalization can leave the output's default
+                    # zero untouched; that is unavailable, not a measured zero.
+                    if forward_context_completed or (parent_forward is not None and parent_forward > 0):
+                        forward_timing["forward"] = parent_forward
+                    if forward_context_completed:
+                        forward_timing["load_kv"] = getattr(
+                            kv_connector_output, "worker_load_kv_time", None
+                        )
+                    # In particular, do not emit before the KV context captures t2.
+                    ttft_diag.emit("forward_breakdown", **forward_timing)
+                except Exception:
+                    pass
         if active_device_metadata_executor is not None:
             active_device_metadata_executor.release()
         with record_function_or_nullcontext("post process"):
@@ -3039,28 +3096,45 @@ class NPUModelRunner(GPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        _ttft_forward_timing: dict[str, Any] | None = None,
         **model_kwargs: dict[str, Any],
     ):
-        assert self.model is not None
-        forward_context = get_forward_context()
-        assert forward_context is not None
+        if _ttft_forward_timing is not None:
+            _ttft_forward_timing["model_forward_status"] = "error"
+        with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_prepare"):
+            assert self.model is not None
+            forward_context = get_forward_context()
+            assert forward_context is not None
 
-        model_inputs: dict[str, Any] = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "intermediate_tensors": intermediate_tensors,
-            "inputs_embeds": inputs_embeds,
-            **model_kwargs,
-        }
-        run_model = partial(self.model, **model_inputs)
+            model_inputs: dict[str, Any] = {
+                "input_ids": input_ids,
+                "positions": positions,
+                "intermediate_tensors": intermediate_tensors,
+                "inputs_embeds": inputs_embeds,
+                **model_kwargs,
+            }
+            run_model = partial(self.model, **model_inputs)
+            if _ttft_forward_timing is not None:
+                with suppress(Exception):
+                    _ttft_forward_timing.update(
+                        graph_mode=str(forward_context.cudagraph_runtime_mode),
+                        capturing=forward_context.capturing,
+                    )
 
         if self.enable_enpu:
             # The soft segmentation scenario requires event.record first, then event.wait
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-            hidden_states = run_model()
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_graph_update"):
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_run"):
+                hidden_states = run_model()
         else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_run"):
+                hidden_states = run_model()
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_graph_update"):
+                self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
+        if _ttft_forward_timing is not None:
+            _ttft_forward_timing["model_forward_status"] = "ok"
 
         return hidden_states
 

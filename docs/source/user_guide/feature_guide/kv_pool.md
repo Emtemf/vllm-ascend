@@ -100,12 +100,45 @@ records omit prompts, addresses, and full cache keys. The separate legacy
 v0.23 comparisons; its logging overhead is included in the save task's `put`
 timer. Treat those raw logs as sensitive.
 
-Report save timings and data volume for one explicitly selected TP (TP0 by
-default). Native phases may be accumulated across serial calls on that TP,
+Report timings and submitted keys/MiB separately for every observed TP.
+`--tp-rank` filters TP rows; the request summary retains all-TP submitted volume.
+Native phases may be accumulated across serial calls on one TP,
 not across parallel TP workers as request latency. The request's
 `BREAKDOWN.save_kv` accumulates EngineCore save values across prefill steps.
 An empty save may still have nonzero enqueue overhead; do not round it to
 zero to identify a no-task call.
+
+Each actual V1 forward body emits one `event=forward_breakdown` completion per
+execution and TP worker, after the KV context exits. It explicitly carries
+`execution_id`, `request_ids`, and `tp_rank`, plus the usual host/PID/thread
+provenance. `forward` reuses the existing `worker_forward_time`; it is `null`
+without an available connector measurement. It does not include entry/exit
+of the surrounding profiling and Ascend forward contexts. Existing
+forward/load/save timings and `BREAKDOWN` accounting are unchanged.
+`load_kv` reuses that worker's existing `worker_load_kv_time` after successful
+context completion. Reports associate it with the same execution, request,
+TP and PID; missing old-log evidence is not replaced with EngineCore timing.
+
+All timing fields are host elapsed **seconds**, not pure device or
+network time. Inside the forward body, `model_call_pre` covers Mamba copy
+preparation or the original batched copy, `model_call` covers `_model_forward`,
+and `model_call_post` covers deferred Mamba-copy completion checks.
+Inside `_model_forward`, `model_prepare` covers input/callable preparation,
+`model_graph_update` covers the existing graph-parameter update call, and
+`model_run` covers the model invocation, including eager or graph replay.
+`branch=graph_update_before_run` or `graph_update_after_run` records the actual
+ordering (ENPU updates first; the 310P speculative full-graph replay path also
+updates first). `graph_mode` and `capturing` describe that invocation.
+
+`status=error` and `failed_stage` identify failed completions without changing
+exception propagation; started phases retain their elapsed time and phases
+not reached remain `null`. `model_forward_status` distinguishes completed,
+failed, and unavailable inner measurements. Timing state belongs to the
+individual call, so nested/draft forwards and graph replay cannot reuse a
+previous call's measurements. No per-layer or per-method events are emitted,
+and the completion log is outside the existing worker forward timer. The
+second-level and third-level fields are nested subdivisions: do not add them
+to their parents or sum parallel TP worker times as request latency.
 
 
 ## 2. Example of using Mooncake as a KV Pool backend

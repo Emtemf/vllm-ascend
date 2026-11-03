@@ -18,7 +18,7 @@
 from __future__ import annotations
 
 import math
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from functools import partial
 from typing import Any, cast
 
@@ -41,6 +41,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import ttft_diagnostics as ttft_diag
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend._310p.block_table import MultiGroupBlockTable as MultiGroupBlockTable310
@@ -615,47 +616,69 @@ class NPUModelRunner310(NPUModelRunner):
         positions: torch.Tensor | None = None,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        *,
+        _ttft_forward_timing: dict[str, Any] | None = None,
         **model_kwargs: dict[str, Any],
     ):
-        if self.uses_mrope:
-            assert positions is not None
-            prepare_mrope_cos_sin_slices_from_runner(self, positions)
+        if _ttft_forward_timing is not None:
+            _ttft_forward_timing["model_forward_status"] = "error"
+        with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_prepare"):
+            if self.uses_mrope:
+                assert positions is not None
+                prepare_mrope_cos_sin_slices_from_runner(self, positions)
 
-        assert self.model is not None
-        forward_context = get_forward_context()
-        assert forward_context is not None
-        model_inputs: dict[str, Any] = {
-            "input_ids": input_ids,
-            "positions": positions,
-            "intermediate_tensors": intermediate_tensors,
-            "inputs_embeds": inputs_embeds,
-            **model_kwargs,
-        }
-        run_model = partial(self.model, **model_inputs)
-        update_before_replay = (
-            self.speculative_config is not None
-            and not self.enable_enpu
-            and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
-            and not forward_context.capturing
-            and hasattr(self, "update_stream")
-        )
+            assert self.model is not None
+            forward_context = get_forward_context()
+            assert forward_context is not None
+            model_inputs: dict[str, Any] = {
+                "input_ids": input_ids,
+                "positions": positions,
+                "intermediate_tensors": intermediate_tensors,
+                "inputs_embeds": inputs_embeds,
+                **model_kwargs,
+            }
+            run_model = partial(self.model, **model_inputs)
+            update_before_replay = (
+                self.speculative_config is not None
+                and not self.enable_enpu
+                and forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+                and not forward_context.capturing
+                and hasattr(self, "update_stream")
+            )
+            if _ttft_forward_timing is not None:
+                with suppress(Exception):
+                    _ttft_forward_timing.update(
+                        branch=(
+                            "graph_update_before_run"
+                            if self.enable_enpu or update_before_replay
+                            else "graph_update_after_run"
+                        ),
+                        graph_mode=str(forward_context.cudagraph_runtime_mode),
+                        capturing=forward_context.capturing,
+                    )
 
         if self.enable_enpu or update_before_replay:
-            if update_before_replay:
-                torch.npu.current_stream().synchronize()
-            self._update_full_graph_params_if_needed(
-                forward_context,
-                num_tokens_padded,
-            )
-            if update_before_replay:
-                torch.npu.current_stream().wait_stream(self.update_stream)
-            hidden_states = run_model()
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_graph_update"):
+                if update_before_replay:
+                    torch.npu.current_stream().synchronize()
+                self._update_full_graph_params_if_needed(
+                    forward_context,
+                    num_tokens_padded,
+                )
+                if update_before_replay:
+                    torch.npu.current_stream().wait_stream(self.update_stream)
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_run"):
+                hidden_states = run_model()
         else:
-            hidden_states = run_model()
-            self._update_full_graph_params_if_needed(
-                forward_context,
-                num_tokens_padded,
-            )
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_run"):
+                hidden_states = run_model()
+            with ttft_diag.measure_elapsed(_ttft_forward_timing, "model_graph_update"):
+                self._update_full_graph_params_if_needed(
+                    forward_context,
+                    num_tokens_padded,
+                )
+        if _ttft_forward_timing is not None:
+            _ttft_forward_timing["model_forward_status"] = "ok"
 
         return hidden_states
 
