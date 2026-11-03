@@ -53,20 +53,24 @@ def capture(thread: Any, payload: Any) -> QueuedDiagnostic:
 
 
 def execute(thread: Any, queued: QueuedDiagnostic) -> None:
-    """Aggregate bounded counters only while executing this queue-owned payload."""
+    """Emit one untimed counter summary while restoring queue-owned context."""
     dequeued_ns = time.monotonic_ns()
-    with (
-        diag.scope(**dict(queued.fields), native_tid=threading.get_native_id()),
-        diag.span(
-            "store_task", enqueued_ns=queued.enqueued_ns, dequeued_ns=dequeued_ns,
-            queue_wait_ns=dequeued_ns - queued.enqueued_ns,
-        ) as fields,
-    ):
+    fields = dict(
+        enqueued_ns=queued.enqueued_ns,
+        dequeued_ns=dequeued_ns,
+        queue_wait_ns=dequeued_ns - queued.enqueued_ns,
+        status="ok",
+    )
+    with diag.scope(**dict(queued.fields), native_tid=threading.get_native_id()):
         token = _task_fields.set(fields)
         try:
             thread._handle_request(queued.payload)
+        except BaseException as exc:
+            fields.update(status="error", error_type=type(exc).__name__)
+            raise
         finally:
             _task_fields.reset(token)
+            diag.emit("store_task", **fields)
 
 
 def _add(**counts: int) -> None:

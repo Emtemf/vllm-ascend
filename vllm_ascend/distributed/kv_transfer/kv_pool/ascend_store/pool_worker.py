@@ -1270,16 +1270,27 @@ class KVPoolWorker:
         cached_keys = list(dict.fromkeys(key for key in keys if key in self._allocated_gvas))
         if not cached_keys:
             return
-        if diag.enabled():
-            with diag.span("store_gva_lookup", count=len(cached_keys), tp_rank=self.tp_rank, direction="save"):
-                exists_states = self.m_store.batch_is_exist(cached_keys)
-            diag.emit("store_gva_lookup_result", status="returned", count=len(cached_keys),
-                      returned_count=len(exists_states), hit_count=sum(state == 1 for state in exists_states),
-                      miss_count=sum(state == 0 for state in exists_states),
-                      error_count=sum(state not in (0, 1) for state in exists_states))
-        else:
+        try:
             exists_states = self.m_store.batch_is_exist(cached_keys)
+        except Exception as exc:
+            store_diag.failure(
+                "store_gva_lookup",
+                status="error",
+                count=len(cached_keys),
+                tp_rank=self.tp_rank,
+                direction="save",
+                error_type=type(exc).__name__,
+            )
+            raise
         if len(exists_states) != len(cached_keys):
+            store_diag.failure(
+                "store_gva_lookup",
+                status="error",
+                count=len(cached_keys),
+                returned_count=len(exists_states),
+                tp_rank=self.tp_rank,
+                direction="save",
+            )
             raise RuntimeError(
                 "MemCache exists check returned unexpected number of states: "
                 f"expected={len(cached_keys)}, actual={len(exists_states)}"
@@ -1288,6 +1299,15 @@ class KVPoolWorker:
             if exists == 0:
                 self._allocated_gvas.pop(key, None)
             elif exists != 1:
+                store_diag.failure(
+                    "store_gva_lookup",
+                    status="error",
+                    count=len(cached_keys),
+                    returned_count=len(exists_states),
+                    tp_rank=self.tp_rank,
+                    direction="save",
+                    error_count=sum(state not in (0, 1) for state in exists_states),
+                )
                 raise RuntimeError(f"MemCache exists check failed for {key}: state={exists}")
 
     def _alloc_gvas_for_save(self, requests: list[ReqMeta]) -> None:

@@ -56,10 +56,11 @@ are single space-free tokens, sequences are comma-joined
 (`request_ids=A,B`), a missing value is `null` (never zero), and booleans are
 `true`/`false`. Store submissions snapshot existing request IDs, a local
 task ID, execution ID, TP rank, layers, and save/load direction, then restore
-that association in the transfer thread. One `store_task` completion carries
-`enqueued_ns`, `dequeued_ns`, and `queue_wait_ns` instead of separate queue
-events. Fixed-size counters aggregate checks (`check_all_hit_count`, for
-example), candidate/all-hit keys, and submitted keys/bytes across groups.
+that association in the transfer thread. One untimed `store_task` completion
+summary carries `enqueued_ns`, `dequeued_ns`, and `queue_wait_ns` instead of
+separate queue events or a task duration span. Fixed-size counters aggregate
+checks (`check_all_hit_count`, for example), candidate/all-hit keys, and
+submitted keys/bytes across groups.
 They do not collect per-group arrays or dynamically named group counters.
 Lookup totals (`lookup_count`, `lookup_key_count`, and observed returned,
 hit/miss/error counts) appear only when a lookup actually occurs; absent
@@ -87,6 +88,8 @@ events; a returned call is not a claim that data was saved. Normal checks,
 lookups, submissions and successful copy/get results do not emit individual
 records. Aggregation is task-local and reset even when processing raises;
 diagnostic helpers outside a task do not create detached success records.
+Worker-side GVA refresh keeps its original existence checks and exceptions, emitting
+only error records rather than per-call timing or successful result records.
 
 These are host-side boundaries without additional device synchronization.
 Layerwise batch-copy submissions are labelled save or load, not native

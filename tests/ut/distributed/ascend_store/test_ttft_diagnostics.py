@@ -127,11 +127,18 @@ class TestStoreDiagnostics(unittest.TestCase):
             raise ValueError("worker failed")
 
         thread._handle_request = fail
-        queued = ttft_diagnostics.capture(thread, SimpleNamespace(req_id="r"))
-        with self.assertRaisesRegex(ValueError, "worker failed"):
-            ttft_diagnostics.execute(thread, queued)
+        with self.diag.scope(execution_id="execution-1", request_ids=("outer",)):
+            queued = ttft_diagnostics.capture(thread, SimpleNamespace(req_id="r"))
+            with self.assertRaisesRegex(ValueError, "worker failed"):
+                ttft_diagnostics.execute(thread, queued)
+            self.assertEqual(self.diag.fields, {"execution_id": "execution-1", "request_ids": ("outer",)})
         self.assertEqual(self.diag.fields, {})
-        self.assertEqual(self.diag.events[-1]["status"], "error")
+        summary = self.diag.events[-1]
+        self.assertEqual(summary["status"], "error")
+        self.assertEqual(summary["error_type"], "ValueError")
+        self.assertEqual(summary["all_hit_key_count"], 5)
+        self.assertEqual(summary["execution_id"], "execution-1")
+        self.assertEqual(summary["task_id"], dict(queued.fields)["task_id"])
         _, empty = self.run_task(thread, lambda: None)
         self.assertNotIn("all_hit_key_count", empty)
 
@@ -234,7 +241,7 @@ class TestStoreDiagnostics(unittest.TestCase):
                 ttft_diagnostics.submitted([[8, 16]], 1)
 
         _, task = self.run_task(thread, action)
-        self.assertEqual([event["event"] for event in self.diag.events], ["store_task"])
+        self.assertEqual(len(self.diag.events), 1)
         self.assertEqual(task["candidate_key_count"], 6)
         self.assertEqual(task["lookup_count"], 3)
         self.assertEqual(task["lookup_hit_count"], 3)
@@ -249,6 +256,37 @@ class TestStoreDiagnostics(unittest.TestCase):
         self.assertEqual(len(self.diag.events), before)
         _, empty = self.run_task(thread, lambda: None)
         self.assertFalse(any(key.startswith(("lookup_", "submitted_", "check_")) for key in empty))
+
+    def test_native_put_failures_preserve_submission_and_identity(self):
+        thread = self.thread()
+        backend = self.backend()
+        backend.store.batch_put_from_multi_buffers.side_effect = [[0, -1], OSError("native failure")]
+
+        def action():
+            ttft_diagnostics.decision("candidate_keys", count=2)
+            ttft_diagnostics.decision("all_hit", count=1)
+            for _ in range(2):
+                ttft_diagnostics.submitted([[8], [16]], 2)
+                backend.put(["a", "b"], [[1], [2]], [[8], [16]])
+
+        with self.diag.scope(execution_id="execution-2"):
+            _, summary = self.run_task(thread, action)
+            self.assertEqual(self.diag.fields, {"execution_id": "execution-2"})
+        self.assertEqual(backend.store.batch_put_from_multi_buffers.call_count, 2)
+        self.assertEqual(summary["candidate_key_count"], 2)
+        self.assertEqual(summary["all_hit_key_count"], 1)
+        self.assertEqual(summary["submitted_key_count"], 4)
+        self.assertEqual(summary["submitted_bytes"], 48)
+        puts = [event for event in self.diag.events if event["event"] == "store_backend_put"]
+        self.assertEqual(len(puts), 2)
+        self.assertEqual(puts[0]["failed_count"], 1)
+        self.assertEqual(puts[1]["status"], "error")
+        for event in self.diag.events:
+            self.assertEqual(event["task_id"], summary["task_id"])
+            self.assertEqual(event["execution_id"], "execution-2")
+            self.assertEqual(event["tp_rank"], 3)
+        _, empty = self.run_task(thread, lambda: None)
+        self.assertNotIn("failure_count", empty)
 
     def test_get_reports_not_executed_and_suppressed_exception(self):
         backend = self.backend()
