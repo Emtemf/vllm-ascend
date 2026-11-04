@@ -2064,6 +2064,9 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        # 主线导读：1. 准备输入 → 2. 执行 forward → 3. 后处理。
+        # 后处理从本方法的 post process 开始，再由后续 sample_tokens() 继续。
+        # 1. 准备：检查状态，将本轮调度安排整理为模型输入和 attention metadata。
         if vllm_version_is("0.27.1"):
             if self.vllm_config.model_config.enable_return_routed_experts and self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
@@ -2112,6 +2115,7 @@ class NPUModelRunner(GPUModelRunner):
                 scheduler_output = deepcopy(scheduler_output)
                 scheduler_output.scheduled_cached_reqs.new_token_ids = []
 
+        # 1.1 若启用 KV connector，先处理抢占，避免后续状态更新覆盖仍需使用的 KV。
         if has_kv_transfer_group():
             kv_connector_metadata = scheduler_output.kv_connector_metadata
             assert kv_connector_metadata is not None
@@ -2119,8 +2123,12 @@ class NPUModelRunner(GPUModelRunner):
             # allocated blocks that may reuse the same physical KV cache IDs.
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
+        # 1.2 读取 Scheduler 安排的本轮 token 总数，开始准备模型输入。
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("prepare input"):
+        with (
+            record_function_or_nullcontext("prepare input"),
+            ttft_diag.worker_range("input_prepare", coverage=False),
+        ):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -2141,7 +2149,7 @@ class NPUModelRunner(GPUModelRunner):
                         ):
                             req_state.prev_num_draft_len = 0
 
-                # Update persistent batch states.
+                # 1.3 将本轮调度结果更新到 Worker 本地的请求和 batch 状态。
                 deferred_state_corrections_fn = self._update_states(
                     scheduler_output
                 )
@@ -2156,6 +2164,7 @@ class NPUModelRunner(GPUModelRunner):
                         self._finalize_dump_data()
                         return make_empty_encoder_model_runner_output(scheduler_output)
 
+                # 1.4 无计算任务时走提前返回；必要时仍处理 KV connector。
                 if not num_scheduled_tokens:
                     if (
                         self.parallel_config.distributed_executor_backend == "external_launcher"
@@ -2179,6 +2188,7 @@ class NPUModelRunner(GPUModelRunner):
                         "it when the requests need prompt logprobs"
                     )
 
+                # 1.5 按当前 batch 的请求顺序，取出各请求本轮安排的 token 数。
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
@@ -2188,8 +2198,10 @@ class NPUModelRunner(GPUModelRunner):
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
                 self._start_dump_data(scheduled_tokens = scheduler_output.num_scheduled_tokens)
+                # 1.6 将 token 数列表转为 NumPy 数组，供输入准备使用。
                 num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+                # 1.7 准备模型输入及推测解码元数据，按顺序接收三个返回值。
                 (
                     logits_indices,
                     spec_decode_metadata,
@@ -2421,13 +2433,17 @@ class NPUModelRunner(GPUModelRunner):
                     has_sinks=self._has_sinks,
                     eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
                 ),
+                # 2.1 执行入口：进入 KV connector 上下文，内部先调用 start_load_kv()。
+                # 这是加载入口，不保证所有异步或逐层加载都已完成。
                 self.maybe_get_kv_connector_output(
                     scheduler_output,
                     **(
                         {"defer_finalize": defer_kv_connector_finalize}
                     ),
                 ) as kv_connector_output,
+                ttft_diag.worker_range("forward"),
             ):
+                # 2.2 执行 forward 区域：调用前处理、模型调用、调用后处理。
                 forward_body_entered = True
                 with ttft_diag.measure_elapsed(forward_timing, "model_call_pre"):
                     # Mamba state copy must run AFTER the KV transfer load finishes,
@@ -2451,6 +2467,7 @@ class NPUModelRunner(GPUModelRunner):
                                 mamba_copy_connector = connector
                         if mamba_copy_connector is None:
                             mamba_utils.do_mamba_copy_block(preprocess_bufs)
+                # 2.2.1 调用 _model_forward()，最终通过 run_model() 调用模型。
                 with ttft_diag.measure_elapsed(forward_timing, "model_call"):
                     hidden_states = self._model_forward(
                         num_tokens_padded,
@@ -2490,7 +2507,11 @@ class NPUModelRunner(GPUModelRunner):
                     pass
         if active_device_metadata_executor is not None:
             active_device_metadata_executor.release()
-        with record_function_or_nullcontext("post process"):
+        # 3.1 后处理：选择 hidden states、计算 logits，保存状态供 sample_tokens() 使用。
+        with (
+            record_function_or_nullcontext("post process"),
+            ttft_diag.worker_range("postprocess", coverage=False),
+        ):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
@@ -2501,6 +2522,12 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output
                     self.kv_connector_output = kv_connector_output
+                    with suppress(Exception):
+                        self._ttft_sample_fields = None
+                        self._ttft_sample_fields = {
+                            **ttft_diag.batch_fields(scheduler_output),
+                            "tp_rank": self.tp_rank,
+                        }
                     self._finalize_dump_data()
                     if self.dynamic_eplb:
                         self.eplb_updator.forward_end(self.eplb_heat_collection_status)
@@ -2552,12 +2579,20 @@ class NPUModelRunner(GPUModelRunner):
                 cudagraph_stats,
                 batch_desc,
             )
+            with suppress(Exception):
+                # Snapshot with the saved state; sample RPCs carry no batch ID.
+                self._ttft_sample_fields = None
+                self._ttft_sample_fields = {
+                    **ttft_diag.batch_fields(scheduler_output),
+                    "tp_rank": self.tp_rank,
+                }
             self.kv_connector_output = kv_connector_output
 
         # Now the batch has been launched we can wait for corrections from the
         # previous model forward without breaking async scheduling.
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
+        # 正常生成路径暂不返回最终结果；后续 sample_tokens() 继续消费保存的状态。
         return None
 
     def _num_drafter_query_tokens(self) -> int:
@@ -2666,6 +2701,7 @@ class NPUModelRunner(GPUModelRunner):
             output.kv_connector_output = kv_connector_output
             return output
 
+        # 后处理续接：取回 execute_model() 在 3.1 保存的 logits 等状态。
         # Unpack ephemeral state.
         (
             scheduler_output,
@@ -2693,7 +2729,11 @@ class NPUModelRunner(GPUModelRunner):
             apply_grammar_bitmask(scheduler_output, grammar_output, self.input_batch, logits)
             logits = logits.to(self.device).to(logits_dtype)
 
-        with record_function_or_nullcontext("sample_token"):
+        # 3.2 后处理：根据 logits 采样或处理推测解码结果，得到本轮 token 结果。
+        with (
+            record_function_or_nullcontext("sample_token"),
+            ttft_diag.worker_range("sample", coverage=False),
+        ):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
@@ -2735,6 +2775,8 @@ class NPUModelRunner(GPUModelRunner):
         output_spec_token_ids = None
         use_padded_batch = False
         early_pp_padded_drafter = False
+        # 3.3 后处理：安排 MTP 等 draft 工作，再收尾此前延迟的 KV 保存。
+        # draft、bookkeeping 的具体先后顺序由下面的分支决定。
         if self.speculative_config:
             use_padded_batch = (
                 self.speculative_config.use_eagle()
@@ -2750,26 +2792,33 @@ class NPUModelRunner(GPUModelRunner):
             if early_pp_padded_drafter:
                 self._draft_token_ids = None
                 self._draft_token_req_ids = None
-                with record_function_or_nullcontext("draft_token"):
+                with (
+                    record_function_or_nullcontext("draft_token"),
+                    ttft_diag.worker_range("draft", coverage=False),
+                ):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
-        (
-            logprobs_lists,
-            valid_sampled_token_ids,
-            prompt_logprobs_dict,
-            req_ids_output_copy,
-            req_id_to_index_output_copy,
-            invalid_req_indices,
-        ) = self._bookkeeping_sync(
-            scheduler_output,
-            sampler_output,
-            logits,
-            hidden_states,
-            scheduler_output.total_num_scheduled_tokens,
-            spec_decode_metadata,
-        )
+        with ttft_diag.worker_range("bookkeeping", coverage=False):
+            (
+                logprobs_lists,
+                valid_sampled_token_ids,
+                prompt_logprobs_dict,
+                req_ids_output_copy,
+                req_id_to_index_output_copy,
+                invalid_req_indices,
+            ) = self._bookkeeping_sync(
+                scheduler_output,
+                sampler_output,
+                logits,
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+                spec_decode_metadata,
+            )
 
-        with record_function_or_nullcontext("draft_token"):
+        with (
+            record_function_or_nullcontext("draft_token"),
+            ttft_diag.worker_range("draft", coverage=False),
+        ):
             if self.speculative_config:
                 if not early_pp_padded_drafter:
                     self._draft_token_ids = None
@@ -2787,6 +2836,7 @@ class NPUModelRunner(GPUModelRunner):
             # forward when speculative decoding is enabled. Finalize here after
             # draft model runs so KV pool save/put can complete.
             if self.speculative_config is not None:
+                # 3.3.1 内部调用 wait_for_save()，补回此前延迟的保存计时。
                 self.finalize_kv_connector()
 
             draft_token_ids = self._draft_token_ids if use_pp_spec_decode else None
@@ -2805,6 +2855,7 @@ class NPUModelRunner(GPUModelRunner):
                         for req_id in req_ids_output_copy
                     ]
 
+        # 3.4 后处理：组装返回结果，携带 token、请求身份及 load/forward/save 时间。
         # TTFT breakdown: copy timing to ModelRunnerOutput top-level fields.
         _mro_load = kv_connector_output.worker_load_kv_time if kv_connector_output else 0.0
         _mro_forward = kv_connector_output.worker_forward_time if kv_connector_output else 0.0

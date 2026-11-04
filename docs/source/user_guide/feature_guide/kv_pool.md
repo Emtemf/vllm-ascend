@@ -140,6 +140,42 @@ and the completion log is outside the existing worker forward timer. The
 second-level and third-level fields are nested subdivisions: do not add them
 to their parents or sum parallel TP worker times as request latency.
 
+`event=worker_phase_breakdown` is one completion for each Worker execute or
+sample call (`phase=execute|sample`), including failed calls (`status=error`).
+It carries explicit original execution/request/TP identity and start/end
+monotonic nanoseconds, wall-clock start and actual native-thread provenance.
+Sample identity is saved alongside the originating Ascend runner state, not
+inferred from the next execution, current RPC context or an async output.
+The async return object is never materialized by diagnostics.
+
+Unlike `forward_breakdown` seconds, these fields are **nanoseconds**.
+`covered_ranges` is a comma-joined sequence of
+`load|forward|save:start_ns:end_ns:native_tid` tokens. They capture the original
+load call, forward body and save call, including exceptional exits. No-KV
+forward bodies are measured directly; absent KV calls are not invented.
+`covered_ns` is their interval union, never their sum. Deferred saves belong
+to the sample call in which they actually run, retaining their originating
+execution ID even when execute and sample run on different threads.
+
+`coverage_scope=observed_original_ranges` and `coverage_complete=true` mean
+that the observed ranges passed identity, containment and same-thread guards;
+they do **not** mean every business operation is covered. Missing boundaries
+produce `coverage_status=unavailable`, while conflicting identity/thread/bounds
+produce `invalid`; both leave `covered_ns` and `uncovered_ns` null.
+`pre_covered_ns`, `post_covered_ns` and `interior_uncovered_ns` divide the local
+complement before, after and between covered ranges. This complement includes
+host orchestration, context entry/exit, diagnostics and logging overhead:
+it is not pure input preparation or device idle time.
+`business_ranges` separately records observed input preparation, postprocess,
+sampling, draft and bookkeeping regions; these can contain covered ranges and
+must not be added to them. Early returns can leave regions absent.
+No-forward paths only claim connector ranges actually reached; failed
+finalization never turns default output zeros into measurements.
+
+These are execution-by-TP **local evidence**, not a per-step allocation of
+the request's residual. Never sum parallel TP rows, move sample time into
+execute, or subtract local uncovered time from `BREAKDOWN` residual.
+
 
 ## 2. Example of using Mooncake as a KV Pool backend
 
