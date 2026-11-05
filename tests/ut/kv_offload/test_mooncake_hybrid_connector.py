@@ -63,6 +63,84 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         thread.request_task_counts_lock = threading.Lock()
         return thread
 
+    def test_request_summary_retains_completion_when_done_acks_finish_in_reverse(self):
+        thread = self._make_thread()
+        self.addCleanup(thread.executor.shutdown, wait=True)
+        thread.use_hybrid = False
+        thread.tp_rank = 0
+        thread.local_engine_id = "decode"
+        thread.pd_connector_id = "connector"
+        thread.vllm_config = types.SimpleNamespace(
+            parallel_config=types.SimpleNamespace(data_parallel_rank=0)
+        )
+        thread.pd_request_tasks = {}
+        thread.request_queue = queue.Queue()
+        thread.task_tracker = KVCacheTaskTracker()
+        thread.task_tracker.add_req_to_process("decode")
+        thread.proc_not_transfer_request = {"prefill-b": object()}
+        thread.proc_not_transfer_request_lock = threading.Lock()
+        thread._transfer_kv_cache = MagicMock()
+        thread._send_done_signal_to_free_remote_port = MagicMock()
+        first_waiting_for_ack = threading.Event()
+        release_first_ack = threading.Event()
+
+        def done_ack(remote_request_id, *_args):
+            if remote_request_id == "prefill-a":
+                first_waiting_for_ack.set()
+                self.assertTrue(release_first_ack.wait(timeout=5))
+
+        thread._send_done_recv_signal = done_ack
+        tasks = []
+        for index, suffix in enumerate(("a", "b")):
+            thread.add_request(
+                request_id="decode",
+                remote_request_id=f"prefill-{suffix}",
+                local_block_ids=[[1]],
+                remote_block_ids=[[2]],
+                remote_engine_id="prefill",
+                remote_host=f"peer-{suffix}",
+                remote_handshake_port=31000 + index,
+                offset=index,
+                tp_num_need_pulls=1,
+                all_task_done=index == 1,
+            )
+            task = thread.request_queue.get_nowait()
+            thread._mark_request_task_submitted(task)
+            tasks.append(task)
+
+        records = []
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector.diag.emit",
+            side_effect=lambda event, **fields: records.append({"event": event, **fields}),
+        ):
+            first = thread.executor.submit(thread._handle_request, tasks[0])
+            try:
+                self.assertTrue(first_waiting_for_ack.wait(timeout=5))
+                self.assertEqual(thread.request_task_counts, {"decode": 1})
+                second = thread.executor.submit(thread._handle_request, tasks[1])
+                second.result(timeout=5)
+                # Native completion still happens before the first task's DONE ACK.
+                self.assertEqual(thread.task_tracker.finished_requests, {"decode"})
+                self.assertFalse(thread.task_tracker.reqs_to_process)
+                self.assertFalse(thread.request_task_counts)
+                self.assertFalse(thread.finished_request_markers)
+                self.assertFalse(thread.proc_not_transfer_request)
+                self.assertEqual(thread.request_queue.unfinished_tasks, 0)
+                self.assertFalse(any(r["event"] == "pd_transfer_request_finished" for r in records))
+            finally:
+                release_first_ack.set()
+                first.result(timeout=5)
+        finished = [r for r in records if r["event"] == "pd_transfer_task_finished"]
+        self.assertEqual([r["tracker_completed"] for r in finished], [True, False])
+        summaries = [r for r in records if r["event"] == "pd_transfer_request_finished"]
+        self.assertEqual(len(summaries), 1)
+        self.assertTrue(summaries[0]["tracker_completed"])
+        self.assertEqual(summaries[0]["submitted_tasks"], 2)
+        self.assertEqual(summaries[0]["succeeded_tasks"], 2)
+        self.assertFalse(thread.pd_request_tasks)
+        self.assertEqual(thread._transfer_kv_cache.call_count, 2)
+        self.assertEqual(thread._send_done_signal_to_free_remote_port.call_count, 2)
+
     def test_group_transfer_and_completion(self):
         thread = self._make_thread()
         self.addCleanup(thread.executor.shutdown, wait=True)

@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_backend_class,
@@ -64,6 +65,45 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_b
 def _format_log_call(call):
     args = call.args
     return args[0] % args[1:]
+
+
+class TestPoolDiagnosticResults(unittest.TestCase):
+    def test_extra_results_do_not_count_as_submitted_key_outcomes(self):
+        for mode, success, failure in (("boolean", True, False), ("zero", 0, -1), ("nonnegative", 8, -1)):
+            for first, extra, succeeded in ((success, failure, 1), (failure, success, 0)):
+                with self.subTest(mode=mode, first=first):
+                    with pool_diag.processing(pool_diag.capture(None, "test", queued=False)) as task:
+                        with pool_diag.backend("test", 1, [[8]], mode) as call:
+                            call.result([first, extra])
+                    counters = task.counters
+                    self.assertEqual(counters["test_submitted_keys"], 1)
+                    self.assertEqual(counters["test_succeeded_keys"], succeeded)
+                    self.assertEqual(counters["test_failed_keys"], 1 - succeeded)
+                    self.assertEqual(counters["test_succeeded_bytes"], 8 * succeeded)
+                    self.assertEqual(counters["test_failed_bytes"], 8 * (1 - succeeded))
+                    self.assertEqual(counters["test_result_count"], 2)
+                    self.assertEqual(counters["test_extra_results"], 1)
+                    self.assertEqual(counters["test_unreported_keys"], 0)
+
+    def test_missing_and_unknown_results_remain_distinct(self):
+        for values, unreported, unknown in (([0], 1, 0), (None, 0, 2)):
+            with self.subTest(values=values):
+                with pool_diag.processing(pool_diag.capture(None, "test", queued=False)) as task:
+                    with pool_diag.backend("test", 2, [[8], [16]]) as call:
+                        call.result(values)
+                self.assertEqual(task.counters["test_unreported_keys"], unreported)
+                self.assertEqual(task.counters["test_unknown_result_keys"], unknown)
+                self.assertEqual(task.status, "unknown_result")
+
+    def test_backend_wrapper_preserves_return_and_exception_identity(self):
+        result = [True, False]
+        store = SimpleNamespace(put=MagicMock(return_value=result))
+        self.assertIs(pool_diag.put(store, ["k"], [[100]], [[8]]), result)
+        failure = RuntimeError("backend sentinel")
+        store.put.side_effect = failure
+        with self.assertRaises(RuntimeError) as raised:
+            pool_diag.put(store, ["k"], [[100]], [[8]])
+        self.assertIs(raised.exception, failure)
 
 
 # =========================================================================
@@ -945,6 +985,42 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store.batch_get_session_start.return_value = []
         with self.assertRaisesRegex(RuntimeError, "returned 0 results for 1 keys"):
             b.batch_get_start(["k"])
+
+    def test_layerwise_iterable_results_are_classified_after_single_normalization(self):
+        cases = (
+            ("batch_put_start", "batch_put_session_start", (["k"], [8]), 0),
+            ("batch_copy_put", "batch_put_from_multi_buffer_ranges", (["k"], [[100]], [[8]], [[0]]), 8),
+            ("batch_copy_get", "batch_get_into_multi_buffer_ranges", (["k"], [[100]], [[8]], [[0]]), 8),
+        )
+        for operation, native_operation, arguments, success in cases:
+            for value in (success, -1):
+                with self.subTest(operation=operation, value=value):
+                    backend = self._make_backend()
+                    consumed = []
+
+                    def results():
+                        consumed.append(value)
+                        yield value
+
+                    getattr(backend.store, native_operation).return_value = results()
+                    with pool_diag.processing(pool_diag.capture(None, operation, queued=False)) as task:
+                        result = getattr(backend, operation)(*arguments)
+                    self.assertEqual(result, [value])
+                    self.assertEqual(consumed, [value])
+                    self.assertEqual(task.counters[native_operation + "_succeeded_keys"], int(value >= 0))
+                    self.assertEqual(task.counters[native_operation + "_failed_keys"], int(value < 0))
+                    self.assertEqual(task.counters[native_operation + "_unknown_result_keys"], 0)
+                    self.assertEqual(task.counters[native_operation + "_succeeded_bytes"], 8 * int(value >= 0))
+                    self.assertEqual(task.counters[native_operation + "_failed_bytes"], 8 * int(value < 0))
+
+    def test_layerwise_normalization_preserves_backend_errors(self):
+        backend = self._make_backend()
+        failure = RuntimeError("native sentinel")
+        backend.store.batch_get_session_start.side_effect = failure
+        with self.assertRaises(RuntimeError) as raised:
+            backend.batch_get_start(["k"])
+        self.assertIs(raised.exception, failure)
+
 
     def test_register_buffer_with_store_independent_te(self):
         b = self._make_backend()

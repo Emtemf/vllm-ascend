@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
 )
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import (
     get_attention_compute_start_gate,
     reset_attention_compute_start_gate,
@@ -775,6 +776,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         batch_size = self.layerwise_max_transfer_blocks if self.layerwise_max_transfer_blocks > 0 else max(1, len(keys))
         return [keys[start : start + batch_size] for start in range(0, len(keys), batch_size)]
 
+    @pool_diag.timed("lookup")
     def _filter_pool_existing_keys(self, keys: list[str]) -> list[str]:
         """Drop keys whose block is already readable in the pool.
 
@@ -791,20 +793,25 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         Failing open (treat as missing) is intentional: an unreadable pool costs
         hits, while a bogus skip would cost the blocks themselves.
         """
+        pool_diag.add(candidate_keys=len(keys))
         if not keys:
             return []
         if not getattr(self.m_store, "requires_exists_before_put", True):
+            pool_diag.add(lookup_skipped_keys=len(keys))
             return keys
         exists = getattr(self.m_store, "exists", None)
         if not callable(exists):
             exists = getattr(self.m_store, "batch_is_exist", None)
         if not callable(exists):
+            pool_diag.add(lookup_skipped_keys=len(keys))
             return keys
 
         missing: list[str] = []
         for key_batch in self._layerwise_key_batches(keys):
             try:
                 states = exists(key_batch)
+                pool_diag.add(lookup_calls=1, lookup_keys=len(key_batch),
+                              lookup_hits=sum(int(state) == 1 for state in states))
                 if len(states) != len(key_batch):
                     raise RuntimeError(
                         "Block-key pool existence check returned unexpected number of states: "
@@ -812,12 +819,15 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     )
                 missing.extend(key for key, state in zip(key_batch, states, strict=True) if int(state) != 1)
             except Exception as exc:
+                pool_diag.add(lookup_failures=1)
                 logger.error(
                     "Block-key pool existence check failed keys=%d error=%s; treating all as missing",
                     len(key_batch),
                     exc,
                 )
                 missing.extend(key_batch)
+        pool_diag.add(missing_keys=len(missing), retained_keys=len(keys) - len(missing),
+                      all_hit_groups=int(bool(keys) and not missing))
         return missing
 
     def _start_layerwise_put_keys(self, keys: list[str], object_size: int) -> list[int]:
@@ -896,10 +906,13 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
         self._current_layerwise_request_ids.difference_update(req_ids)
         self._current_layerwise_last_chunk_req_ids.difference_update(req_ids)
 
+    @pool_diag.task("save_prepare")
+    @pool_diag.timed("prepare")
     def _prepare_layerwise_put_session(self, request: ReqMeta) -> None:
         request.save_block_keys = []
         request.save_last_block_key = None
         if not self._is_layerwise_save_owner() or not request.can_save:
+            pool_diag.outcome("skipped")
             return
 
         start_block = request.save_start_token // self.block_size
@@ -925,11 +938,13 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             key_slots.append((request.save_last_block_key, None, request.partial_block_index))
 
         requested_keys = list(dict.fromkeys(key for key, _, _ in key_slots))
+        pool_diag.add(candidate_keys=len(requested_keys))
         if not requested_keys:
             return
         with self._put_started_keys_lock:
             previously_started = set(requested_keys) & self._put_started_keys
             new_keys = [key for key in requested_keys if key not in self._put_started_keys]
+            pool_diag.add(inflight_keys=len(previously_started), missing_keys=len(new_keys))
 
         started = set(previously_started)
         if new_keys:
@@ -959,6 +974,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             ((key, block_index) for key, _, block_index in key_slots if key in started),
         )
 
+    @pool_diag.task("load_key_prepare")
+    @pool_diag.timed("build_key")
     def _prepare_layerwise_get_session(self, request: ReqMeta) -> list[tuple[str, int, int | None]]:
         request.load_block_keys = []
         request.load_last_block_key = None
@@ -1006,6 +1023,7 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             key_slots.append((key, request.block_ids[block_index], block_index))
         return key_slots
 
+    @pool_diag.task("load_prepare")
     def _open_layerwise_get_sessions(self, request_key_slots: list[tuple[ReqMeta, str, int, int | None]]) -> None:
         if not request_key_slots:
             return
@@ -1459,7 +1477,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                         break
                 if first_task is None:
                     continue
-                shared = self.kv_send_thread.build_shared_data(first_task)
+                with pool_diag.processing(pool_diag.capture(first_task, "save_prepare", self.tp_rank, queued=False)):
+                    shared = self.kv_send_thread.build_shared_data(first_task)
                 if shared is not None:
                     all_save_keys.extend(shared.save_keys)
                     for layer_id in range(self.num_layers):
@@ -1482,7 +1501,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     break
             if first_task is None:
                 return
-            cached = self.kv_send_thread.build_cached_process_tokens(first_task)
+            with pool_diag.processing(pool_diag.capture(first_task, "save_key_prepare", self.tp_rank, queued=False)):
+                cached = self.kv_send_thread.build_cached_process_tokens(first_task)
             if cached is not None:
                 for layer_id in range(self.num_layers):
                     for task in self.layer_save_tasks[layer_id]:
@@ -2031,7 +2051,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                         break
                 if first_task is None:
                     continue
-                shared = self.kv_recv_thread.build_shared_data(first_task)
+                with pool_diag.processing(pool_diag.capture(first_task, "load_prepare", self.tp_rank, queued=False)):
+                    shared = self.kv_recv_thread.build_shared_data(first_task)
                 if shared is not None:
                     for layer_id in range(self.num_layers):
                         for task in self.layer_load_tasks[layer_id]:
@@ -2055,7 +2076,8 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     )
                     key = (task.use_key_major_ranges, ranges)
                     if key not in shared_by_ranges:
-                        shared = self.kv_recv_thread.build_shared_data(task)
+                        with pool_diag.processing(pool_diag.capture(task, "load_prepare", self.tp_rank, queued=False)):
+                            shared = self.kv_recv_thread.build_shared_data(task)
                         if shared is not None:
                             # The builder reuses scratch arrays on the next
                             # call; retain each selection's own snapshot.
@@ -2099,7 +2121,12 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
             num_local = getattr(self, "layerwise_key_layers", 0) or self.num_layers
         else:
             num_local = self.num_layers
-        self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+        snapshot = self._diagnostic_deferred_save_snapshot
+        self._diagnostic_deferred_save_snapshot = None
+        with pool_diag.processing(snapshot):
+            with pool_diag.stage("save_wait"):
+                self._wait_for_final_layer_save(num_local, self.kv_send_thread)
+            pool_diag.outcome("wait_returned")
 
     def process_layer_data(self, requests: list[ReqMeta]) -> None:
         self._masked_runs_cache.clear()
@@ -2135,6 +2162,21 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                     group_requests.get(group_id, requests), local_layer, group_id, layer_idx_in_group
                 )
         self._build_shared_load_data()
+        # The last actual queue entry is the completion fence, not necessarily
+        # the model's final layer (which may have no reachable transfer rows).
+        if self.kv_send_thread is not None:
+            self.kv_send_thread._diagnostic_final_layer_id = max(
+                (layer_id for layer_id, tasks in enumerate(self.layer_save_tasks) if tasks), default=-1
+            )
+        if self.kv_recv_thread is not None:
+            self.kv_recv_thread._diagnostic_final_layer_id = max(
+                (
+                    layer_id
+                    for layer_id, tasks in enumerate(self.layer_load_tasks)
+                    if tasks or layer_id in self.prefetch_layer_map
+                ),
+                default=-1,
+            )
 
     def _submit_attention_save(self, layer_id: int) -> None:
         """Start current-layer put only once KV is ready at attention entry."""
@@ -2358,8 +2400,14 @@ class LayerwiseKVPoolWorker(KVPoolWorker):
                 # start of the NEXT step's start_load_kv, absorbing the send
                 # thread's tail latency into the inter-step scheduling gap.
                 self._pending_last_save_drain = True
+                self._diagnostic_deferred_save_snapshot = pool_diag.capture(
+                    connector_metadata, "save_wait", self.tp_rank, queued=False
+                )
             else:
-                self._wait_for_final_layer_save(num_local, send_thread)
+                with pool_diag.processing(pool_diag.capture(connector_metadata, "save_wait", self.tp_rank, queued=False)):
+                    with pool_diag.stage("save_wait"):
+                        self._wait_for_final_layer_save(num_local, send_thread)
+                    pool_diag.outcome("wait_returned")
         self.current_layer += 1
 
     def _wait_for_final_layer_save(self, num_local: int, send_thread: KVTransferThread) -> None:

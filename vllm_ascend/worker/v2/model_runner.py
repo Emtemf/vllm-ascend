@@ -33,6 +33,8 @@ from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
+from vllm.v1.metrics import pd_diagnostics as diag
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.worker.dp_utils import skip_dp_coordination
@@ -405,6 +407,7 @@ class NPUModelRunner(GPUModelRunner):
         self.execute_model_state = state
 
     @runtime_guard_sample_tokens
+    @pd_sample
     def sample_tokens(self, grammar_output):
         if (
             lmhead_tp_enable()
@@ -703,6 +706,7 @@ class NPUModelRunner(GPUModelRunner):
     # wave sync keeps running inside the inference-mode context.
     @torch.inference_mode()
     @runtime_guard_step
+    @pd_execution
     def execute_model(
         self,
         scheduler_output: SchedulerOutput,
@@ -1207,7 +1211,8 @@ class NPUModelRunner(GPUModelRunner):
             capacity,
             "max_num_reqs * decode_query_len",
         )
-        logits = self.model.compute_logits(hidden_states[sample_indices])
+        with diag.span("runner.logits", completion="host_return"):
+            logits = self.model.compute_logits(hidden_states[sample_indices])
         logits = logits[:num_logits]
 
         # Dispatch tail mirrors GPUModelRunner.sample; refresh it on main bumps.
@@ -1234,18 +1239,20 @@ class NPUModelRunner(GPUModelRunner):
 
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
+            with diag.span("runner.sampling", algorithm="sampler", completion="host_return"):
+                sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
-                input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
-                invalid_drafts,
-            )
+            with diag.span("runner.sampling", algorithm="rejection", completion="host_return"):
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                    invalid_drafts,
+                )
 
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
 
