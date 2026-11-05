@@ -68,6 +68,10 @@ The paired vLLM/Ascend diagnostic implementation emits `[PD_DIAG]` JSON through
 `vllm.v1.metrics.pd_diagnostics`. It does not enable the model profiler, add device
 synchronization, retry transfers, or change backend results and completion fences.
 
+Diagnostic wrappers preserve the original methods' positional and keyword calling
+conventions, return objects, and exceptions. Argument observation does not rebind
+or validate business calls.
+
 * `pool_task` is a bounded summary for an existing save/load job or a preparation/
   submission operation. It carries `task_id`, `operation`, `request_id` (or
   `request_ids` for shared work), `execution_id`, the existing `store_job_id` when

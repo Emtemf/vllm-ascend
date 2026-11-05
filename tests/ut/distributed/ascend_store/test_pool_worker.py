@@ -685,6 +685,31 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
 
         return KVPoolWorker
 
+    def test_diagnostic_task_preserves_original_exception_identity(self):
+        failure = RuntimeError("save eligibility sentinel")
+
+        class FailingRequest:
+            req_id = "request"
+
+            @property
+            def can_save(self):
+                raise failure
+
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.tp_rank = 0
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        metadata = AscendConnectorMetadata(set())
+        metadata.requests = [FailingRequest()]
+        method = cls.wait_for_save
+        calls = (((worker, metadata), {}), ((worker,), {"connector_metadata": metadata}))
+        for function in (method.__wrapped__, method):
+            for args, kwargs in calls:
+                with self.subTest(wrapped=function is method, kwargs=tuple(kwargs)):
+                    with self.assertRaises(RuntimeError) as raised:
+                        function(*args, **kwargs)
+                    self.assertIs(raised.exception, failure)
+
     def test_global_group_alloc_size_rounds_up(self):
         cls = self._make_worker_class()
         worker = cls.__new__(cls)
@@ -1432,28 +1457,35 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
 
     def test_wait_for_save_submits_batch_without_joining_queue(self):
-        worker = self._make_worker()
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        worker.kv_send_thread.request_queue = MagicMock()
-        save_batch = MagicMock()
-        worker.kv_send_thread.add_save_batch.return_value = save_batch
-
-        req = ReqMeta(
-            req_id="r1",
-            token_len_chunk=16,
-            block_ids=[0],
-            block_hashes=["h0"],
-            can_save=True,
-        )
-        meta = AscendConnectorMetadata(set(), set())
-        meta.add_request(req)
-        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-        with patch(f"{module}.torch.npu", create=True):
-            worker.wait_for_save(meta)
-        worker.kv_send_thread.raise_if_failed.assert_not_called()
-        worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
-        worker.kv_send_thread.request_queue.join.assert_not_called()
-        self.assertIs(worker._previous_save_batch, save_batch)
+        for use_keyword in (False, True):
+            with self.subTest(use_keyword=use_keyword):
+                worker = self._make_worker()
+                worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+                worker.kv_send_thread.request_queue = MagicMock()
+                save_batch = object()
+                worker.kv_send_thread.add_save_batch.return_value = save_batch
+                req = ReqMeta(
+                    req_id="r1",
+                    token_len_chunk=16,
+                    block_ids=[0],
+                    block_hashes=["h0"],
+                    can_save=True,
+                )
+                meta = AscendConnectorMetadata(set(), set())
+                meta.add_request(req)
+                module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+                with patch(f"{module}.torch.npu", create=True) as npu:
+                    if use_keyword:
+                        worker.wait_for_save(connector_metadata=meta)
+                    else:
+                        worker.wait_for_save(meta)
+                worker.kv_send_thread.raise_if_failed.assert_not_called()
+                worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
+                worker.kv_send_thread.request_queue.join.assert_not_called()
+                self.assertIs(worker._previous_save_batch, save_batch)
+                self.assertIs(req.current_event, npu.Event.return_value)
+                self.assertIs(req.skip_null_blocks_by_group, worker.group_uses_align_state)
+                npu.Event.return_value.record.assert_called_once_with()
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()

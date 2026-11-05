@@ -7,6 +7,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
+from inspect import signature
 from typing import Any
 
 from vllm.v1.metrics import pd_diagnostics as diag
@@ -266,11 +267,14 @@ def backend(operation: str, key_count: int, sizes: Any = None, mode: str = "zero
 def task(operation: str):
     """Scope synchronous worker work; queued work is scoped by the dispatcher."""
     def decorate(function):
+        self_name, request_name = tuple(signature(function).parameters)[:2]
         @wraps(function)
-        def wrapped(self, request, *args, **kwargs):
-            snapshot = capture(request, operation, getattr(self, "tp_rank", None), queued=False)
+        def wrapped(*args, **kwargs):
+            instance = args[0] if args else kwargs.get(self_name)
+            request = args[1] if len(args) > 1 else kwargs.get(request_name)
+            snapshot = capture(request, operation, getattr(instance, "tp_rank", None), queued=False)
             with processing(snapshot):
-                return function(self, request, *args, **kwargs)
+                return function(*args, **kwargs)
         return wrapped
     return decorate
 
