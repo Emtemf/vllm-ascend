@@ -15,6 +15,7 @@ from vllm.config import ParallelConfig
 from vllm.logger import logger
 from vllm.utils.network_utils import get_ip
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mooncake_layerwise
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
@@ -629,7 +630,14 @@ class MooncakeBackend(Backend):
         method = getattr(self.store, operation, None)
         if not callable(method):
             raise RuntimeError(f"Mooncake client does not support {operation}")
-        return require_aligned_batch_results(operation, keys, method(*args))
+        sizes = args[1] if operation == "batch_put_session_start" else (
+            args[2] if operation in ("batch_put_from_multi_buffer_ranges", "batch_get_into_multi_buffer_ranges") else None
+        )
+        mode = "nonnegative" if operation in ("batch_put_from_multi_buffer_ranges", "batch_get_into_multi_buffer_ranges") else "zero"
+        with pool_diag.backend(operation, len(keys), sizes, mode) as call:
+            results = require_aligned_batch_results(operation, keys, method(*args))
+            call.result(results)
+            return results
 
     def batch_put_start(self, keys: list[str], sizes: list[int]) -> list[int]:
         return self._call_layerwise_batch(
@@ -688,7 +696,10 @@ class MooncakeBackend(Backend):
         method = getattr(self.store, "batch_get_session_end", None)
         if not callable(method):
             raise RuntimeError("Mooncake client does not support batch_get_session_end")
-        return int(method(keys))
+        with pool_diag.backend("batch_get_session_end", len(keys)) as call:
+            result = int(method(keys))
+            call.batch_result(result)
+            return result
 
     def put(self, keys: list[str], addrs: list[list[int]], sizes: list[list[int]]) -> list[bool] | bool:
         self.ensure_initialized()
@@ -696,7 +707,9 @@ class MooncakeBackend(Backend):
         try:
             config = self._build_replicate_config()
             _emit_whole_key_debug_event("put", len(keys))
-            res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+            with pool_diag.backend("mooncake_put", len(keys), sizes, mode="nonnegative") as call:
+                res = self.store.batch_put_from_multi_buffers(keys, addrs, sizes, config)
+                call.result(res)
             failed_codes = [int(value) for value in res if value < 0]
             failed_count = len(failed_codes)
             if failed_count:
@@ -742,8 +755,10 @@ class MooncakeBackend(Backend):
         )
         try:
             _emit_whole_key_debug_event("get", len(keys))
-            res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
-            res_list = list(res)
+            with pool_diag.backend("mooncake_get", len(keys), sizes, mode="nonnegative") as call:
+                res = self.store.batch_get_into_multi_buffers(keys, addrs, sizes)
+                res_list = list(res)
+                call.result(res_list)
             failed_codes = [int(value) for value in res_list if value < 0]
             failed_count = len(failed_codes)
             error_codes = sorted(set(failed_codes))

@@ -756,6 +756,7 @@ class KVPoolScheduler:
         meta = AscendConnectorMetadata(
             scheduler_output.preempted_req_ids,
             self._loading_req_ids.copy(),
+            pd_execution_id=scheduler_output.pd_execution_id,
         )
         # Immediate block free: requests finished in the previous output
         # processing and requests preempted by this schedule released their

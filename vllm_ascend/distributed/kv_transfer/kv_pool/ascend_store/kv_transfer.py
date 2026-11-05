@@ -4,6 +4,7 @@ import ctypes
 import queue
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 from typing import Any
 
@@ -11,7 +12,9 @@ import numpy as np
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
+from vllm.v1.metrics import pd_diagnostics as diag
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import Backend
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.memcache_backend import (
@@ -27,6 +30,7 @@ _TRANSFER_SHUTDOWN_POLL_S = 0.1
 
 
 class KVTransferThread(threading.Thread):
+    _diag_operation = "unknown"
     _invalid_block_ids: set[int]
     _invalid_block_ids_lock: threading.Lock
 
@@ -64,6 +68,10 @@ class KVTransferThread(threading.Thread):
         self._fatal_error: BaseException | None = None
         self.save_disabled = threading.Event()
         self.load_disabled = threading.Event()
+        self._diagnostic_pending: dict[int, deque[tuple[pool_diag.Snapshot, bool]]] = {}
+        self._diagnostic_final_layer_id: int | None = None
+        self._diagnostic_layer_task: pool_diag.Task | None = None
+        self._diagnostic_layer_key: tuple | None = None
 
     def _mark_failed_requests(self, requests: list[ReqMeta]) -> None:
         logger.error("Memcache transfer failed for requests=%s", [request.req_id for request in requests])
@@ -102,7 +110,75 @@ class KVTransferThread(threading.Thread):
             if self._fatal_error is not None:
                 logger.error("Reject KV transfer submission to failed thread %s: %s", self.name, self._fatal_error)
                 return
+            self._capture_diagnostics(request)
             self.request_queue.put(request)
+
+    def _capture_diagnostics(self, request: Any) -> None:
+        snapshot = pool_diag.capture(request, self._diag_operation, self.tp_rank)
+        layers = getattr(request, "transfer_tasks", request)
+        layer_id = (
+            layers[0].layer_id
+            if isinstance(layers, list) and layers and hasattr(layers[0], "layer_id")
+            else getattr(request, "layer_id", None)
+        )
+        final_layer_id = self._diagnostic_final_layer_id
+        if final_layer_id is None:
+            final_layer_id = getattr(self, "final_layer_id", None)
+        # Freeze the actual queued tail at submission: the next step may prepare
+        # a different layout before this consumer finishes the current one.
+        final = layer_id is None or layer_id == final_layer_id
+        self._diagnostic_pending.setdefault(id(request), deque()).append((snapshot, final))
+
+    def _discard_diagnostics(self) -> None:
+        for pending in self._diagnostic_pending.values():
+            for snapshot, _ in pending:
+                task = pool_diag.Task(snapshot)
+                task.status = "not_processed"
+                task.finish(incomplete=True)
+        self._diagnostic_pending.clear()
+
+    def _dispatch_diagnostic_request(self, request: Any) -> None:
+        with self._request_submit_lock:
+            pending = self._diagnostic_pending.get(id(request))
+            entry = pending.popleft() if pending else None
+            if pending is not None and not pending:
+                self._diagnostic_pending.pop(id(request), None)
+        if entry is None:
+            # Fences/control work and callers bypassing submission have no measured queue entry.
+            self._handle_request(request)
+            return
+        snapshot, final = entry
+        layers = getattr(request, "transfer_tasks", request)
+        layer_id = (
+            layers[0].layer_id
+            if isinstance(layers, list) and layers and hasattr(layers[0], "layer_id")
+            else getattr(request, "layer_id", None)
+        )
+        task = None
+        if layer_id is not None:
+            executions = tuple(sorted({str(dict(member).get("execution_id")) for member in snapshot.members}))
+            key = executions if executions != ("None",) else tuple(
+                sorted(str(dict(member).get("request_id")) for member in snapshot.members)
+            )
+            if not snapshot.members and self._diagnostic_layer_task is not None:
+                # A reuse-only load still belongs to the preceding queued batch.
+                key = self._diagnostic_layer_key
+            if self._diagnostic_layer_task is not None and key != self._diagnostic_layer_key:
+                self._diagnostic_layer_task.finish(incomplete=True)
+                self._diagnostic_layer_task = None
+            if self._diagnostic_layer_task is None:
+                self._diagnostic_layer_task = pool_diag.Task(snapshot)
+                self._diagnostic_layer_key = key
+            task = self._diagnostic_layer_task
+        try:
+            with pool_diag.processing(snapshot, task, final):
+                self._handle_request(request)
+        except BaseException:
+            final = True
+            raise
+        finally:
+            if final and task is self._diagnostic_layer_task:
+                self._diagnostic_layer_task = None
 
     def stop(self) -> None:
         with self._request_submit_lock:
@@ -111,6 +187,7 @@ class KVTransferThread(threading.Thread):
                 if self.is_alive():
                     self.request_queue.put(None)
 
+    @pool_diag.timed("wait")
     def _wait_for_event(
         self,
         event: threading.Event | AttentionComputeStartGate,
@@ -229,12 +306,15 @@ class KVTransferThread(threading.Thread):
                 split_gvas.tolist(),
                 split_sizes.tolist(),
             )
-            res = self.m_store.store.batch_copy(
-                split_gvas.tolist(),
-                split_addrs.tolist(),
-                split_sizes.tolist(),
-                direction,
-            )
+            pool_diag.add(copy_submitted_ranges=len(split_gvas), copy_submitted_bytes=int(split_sizes.sum()))
+            with pool_diag.stage("backend_batch_copy"):
+                res = self.m_store.store.batch_copy(
+                    split_gvas.tolist(),
+                    split_addrs.tolist(),
+                    split_sizes.tolist(),
+                    direction,
+                )
+            pool_diag.add(copy_batch_succeeded=int(res == 0), copy_batch_failed=int(res != 0))
             if res != 0:
                 logger.error("[KVPOOL] batch_copy %s FAILED res=%d", dir_name, res)
                 return res
@@ -325,12 +405,17 @@ class KVTransferThread(threading.Thread):
                 if request_data is None or self._stopping.is_set():
                     self.request_queue.task_done()
                     if request_data is None:
+                        if self._diagnostic_layer_task is not None:
+                            self._diagnostic_layer_task.finish(incomplete=True)
+                            self._diagnostic_layer_task = None
+                        self._discard_diagnostics()
                         return
                     continue
-                self._handle_request(request_data)
+                self._dispatch_diagnostic_request(request_data)
             except Exception as e:
                 with self._request_submit_lock:
                     self._fatal_error = e
+                    self._discard_diagnostics()
                     try:
                         self._handle_request_exception(request_data)
                     except Exception:
@@ -350,6 +435,7 @@ class KVTransferThread(threading.Thread):
         """Allow subclasses to complete queue/request bookkeeping on errors."""
         pass
 
+    @pool_diag.timed("lookup")
     def lookup(
         self,
         keys: list[str],
@@ -359,12 +445,15 @@ class KVTransferThread(threading.Thread):
         :return: A bool list where True means the key exists in store.
         """
         try:
+            pool_diag.add(lookup_calls=1, lookup_keys=len(keys))
             res = self.m_store.exists(keys)  # type: ignore[assignment]
             exists_list = [False] * len(keys)
             for index, value in enumerate(res):  # type: ignore[arg-type]
                 exists_list[index] = value == 1
+            pool_diag.add(lookup_hits=sum(exists_list), lookup_misses=len(keys) - sum(exists_list))
             return exists_list
         except Exception as e:
+            pool_diag.add(lookup_failures=1)
             logger.error(
                 "Remote connection failed in lookup. type=%s, error=%s. Check network and remote store.",
                 type(e).__name__,
@@ -379,6 +468,7 @@ class KVTransferThread(threading.Thread):
         publishers, can force connector-side filtering.
         """
         if not require_exists_check and not self.m_store.requires_exists_before_put:
+            pool_diag.add(lookup_skipped_keys=len(keys))
             return list(range(len(keys)))
         exists_states = self.lookup(keys)
         return [index for index, exists in enumerate(exists_states) if not exists]
@@ -454,6 +544,7 @@ SAVE_REQUEST_POLL_INTERVAL_S = 0.001
 
 
 class KVCacheStoreSendingThread(KVTransferThread):
+    _diag_operation = "save"
     def __init__(
         self,
         m_store: Backend,
@@ -569,6 +660,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
             for request in requests:
                 self.add_stored_request(request)
             for request in requests:
+                self._capture_diagnostics(request)
                 self.request_queue.put(request)
             self.request_queue.put(save_batch)
         return save_batch
@@ -627,7 +719,11 @@ class KVCacheStoreSendingThread(KVTransferThread):
             remaining = len(jobs)
             if remaining == 0:
                 del self.stored_requests[req_meta.req_id]
-            return remaining
+        pool_diag.add(completed_store_jobs=1)
+        diag.emit("pool_store_completion", request_id=req_meta.req_id, execution_id=req_meta.pd_execution_id,
+                  store_job_id=req_meta.store_job_id, tp_rank=self.tp_rank, remaining_jobs=remaining,
+                  completion_semantics="bookkeeping_only")
+        return remaining
 
     def delete_finished_stored_request(self, req_id: str):
         with self.done_task_lock:
@@ -740,6 +836,8 @@ class KVCacheStoreSendingThread(KVTransferThread):
             tracked_request = self.is_live_store_job(req_meta)
             try:
                 succeeded = self.worker._store_kv_tp_mismatch(req_meta)
+                if succeeded is not True:
+                    pool_diag.outcome("failed")
                 if tracked_request:
                     if succeeded is True:
                         self.record_saved_offset(req_meta, req_meta.token_len_chunk)
@@ -747,6 +845,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
                     else:
                         self._remember_retry_token_ids(req_meta)
             except Exception:
+                pool_diag.outcome("exception")
                 self._remember_retry_token_ids(req_meta)
                 logger.exception("Failed to store KV cache for TP-mismatch request %s", req_id)
             finally:
@@ -764,15 +863,19 @@ class KVCacheStoreSendingThread(KVTransferThread):
         try:
             tracked_request = self.is_live_store_job(req_meta)
             if not tracked_request:
+                pool_diag.outcome("stale_job")
                 return
             # Only explicit success may advance the saved offset; failures return False.
             succeeded = self._handle_stored_request(req_meta)
+            if succeeded is not True:
+                pool_diag.outcome("failed")
             if succeeded is True:
                 self.record_saved_offset(req_meta, req_meta.token_len_chunk)
                 self._clear_retry_token_ids(req_meta)
             else:
                 self._remember_retry_token_ids(req_meta)
         except Exception:
+            pool_diag.outcome("exception")
             self._remember_retry_token_ids(req_meta)
             logger.exception("Failed to store KV cache for request %s", req_id)
         finally:
@@ -788,6 +891,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
         """Store missing KV chunks; log validation/PUT failures and return False."""
         if req_meta.can_save is False:
             return False
+        pool_diag.add(candidate_keys=0)
         token_len = req_meta.token_len_chunk
         req_id = req_meta.req_id
         current_event = req_meta.current_event
@@ -873,7 +977,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 key_block_ids.append(block_id)
 
             if not keys:
+                pool_diag.add(empty_groups=1)
                 continue
+            pool_diag.add(candidate_keys=len(keys))
             partitions = getattr(self.token_database, "partitions", None)
             if self.kv_role == "kv_consumer" and partitions is not None and len(partitions) > 1:
                 # Decode consumers split one logical block across Prefill PP
@@ -885,7 +991,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 missing_indices = [index for index, exists in enumerate(exists_states) if not exists]
             else:
                 missing_indices = self._get_missing_indices(keys, require_exists_check=self.enable_kv_event)
+            pool_diag.add(missing_keys=len(missing_indices), retained_keys=len(keys) - len(missing_indices))
             if not missing_indices:
+                pool_diag.add(all_hit_groups=1)
                 continue
             starts = [starts[index] for index in missing_indices]
             ends = [ends[index] for index in missing_indices]
@@ -972,8 +1080,9 @@ class KVCacheStoreSendingThread(KVTransferThread):
                 )
                 return False
             if current_event is not None:
-                current_event.synchronize()
-            put_result = self.m_store.put(keys, addrs, sizes)
+                with pool_diag.stage("sync"):
+                    current_event.synchronize()
+            put_result = pool_diag.put(self.m_store, keys, addrs, sizes)
             if isinstance(put_result, list):
                 if len(put_result) != len(keys):
                     logger.error("KV store backend returned %s results for %s keys", len(put_result), len(keys))
@@ -1010,6 +1119,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
 
 class KVCacheStoreRecvingThread(KVTransferThread):
+    _diag_operation = "load"
     def __init__(
         self,
         m_store: Backend,
@@ -1044,6 +1154,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             load_spec = req_meta.load_spec
             req_id = req_meta.req_id
             if load_spec is None:
+                pool_diag.outcome("missing_load_spec")
                 logger.error("KV pool async recv request %s has no load spec; skip load.", req_id)
                 self.set_finished_request(req_id)
                 return
@@ -1099,6 +1210,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     size_list.append(size)
                     block_id_list.append(block_id)
             if not key_list:
+                pool_diag.outcome("no_task")
                 self.set_finished_request(req_id)
                 return
             key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
@@ -1116,7 +1228,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 key_list_c[:3],
             )
             load_get_start = time.perf_counter() if self._record_operation_cb is not None else 0.0
-            ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            ret = pool_diag.get(self.m_store, key_list_c, addr_list_c, size_list_c)
             if self._record_operation_cb is not None:
                 self._record_operation_cb(
                     "load_get",

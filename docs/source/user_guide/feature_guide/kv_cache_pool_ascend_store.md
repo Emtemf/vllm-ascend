@@ -62,6 +62,64 @@ For non-layerwise complete-block transfers, adjacent MLA components sharing one 
 
 This bulk fast path uses physical-page-major object contents instead of the previous component-major segmented contents. A fresh namespace is required even when upgrading from the earlier segmented version of this fix. Writers and readers must agree on transfer mode and cache layout; do not share these objects with layerwise readers or workers using a different component layout.
 
+## Per-request Pool diagnostics
+
+The paired vLLM/Ascend diagnostic implementation emits `[PD_DIAG]` JSON through
+`vllm.v1.metrics.pd_diagnostics`. It does not enable the model profiler, add device
+synchronization, retry transfers, or change backend results and completion fences.
+
+* `pool_task` is a bounded summary for an existing save/load job or a preparation/
+  submission operation. It carries `task_id`, `operation`, `request_id` (or
+  `request_ids` for shared work), `execution_id`, the existing `store_job_id` when
+  present, and the proved worker `tp_rank` plus available contextual ranks.
+  `pool_task_member` explicitly links members of a shared task. Shared work must
+  not be charged exclusively to every member or summed across parallel TP workers.
+* Scheduler `pd_execution_id` is copied to connector metadata and request metadata
+  without overwriting an already-bound origin. Queue entry captures immutable
+  identities, restored in the processing thread. Layerwise views retain their
+  request's origin, including deferred/MTP saves. Missing identities remain unknown.
+* `start_ns`, `end_ns`, and `duration_ns` use the host monotonic clock.
+  `queue_enter_ns` is present only for a measured queue entry; synchronous work has
+  a null queue timestamp, not a measured zero wait. `counters.queue_wait_ns` sums
+  actual queue-entry waits for the task. Cross-host clocks are not interchangeable.
+* `stages` contains bounded aggregates for real `build_key`, `lookup`, `prepare`,
+  existing `sync`/`wait`, queue submission, and backend calls. Each stage contains
+  `calls`, `start_ns`, `end_ns`, summed `duration_ns`, and `exceptions`.
+  With multiple calls, the start/end pair is an envelope, not a contiguous native
+  call. Stages can overlap; neither stage sums nor host elapsed are NPU compute time.
+* `counters` retain candidate/missing/retained keys, lookup hits/failures/skips,
+  all-hit groups, and submitted/result/succeeded/failed/unknown keys and bytes.
+  `put_*`/`get_*` describe the connector contract; `mooncake_put_*`/
+  `mooncake_get_*` describe the actual native submission. These are two views of
+  the same work and must not be added together. Result-shape mismatches retain
+  unreported/extra counts. An exception or missing result is not a measured
+  zero-byte success. Batch-only results do not invent per-key outcomes.
+  Only results corresponding to submitted keys contribute successful/failed key
+  counts; extra entries cannot create additional successful keys.
+* The actual Mooncake session/range APIs are measured separately:
+  `batch_put_session_start`, `batch_put_from_multi_buffer_ranges`,
+  `batch_put_session_end`, `batch_put_session_revoke`, and their get counterparts.
+  Object reservation sizes are not copied payload bytes. Copy results use the
+  actual nonnegative-success contract; session/commit/revoke use zero-success.
+  Valid iterable results are normalized once before classification. Layerwise
+  entries aggregate through the last actual queue-ordered transfer, including
+  layouts with an empty final layer. Shared GVA/key preparation is observed at
+  the precompute call itself, rather than charged again to each layer.
+  Interrupted/incomplete aggregates carry `incomplete=true`.
+* Status distinguishes `no_task`, `all_hit`, `succeeded`, `backend_failure`,
+  `unknown_result`, `failed`, `exception`, `skipped`, and missing load metadata.
+  `submission_returned` means only that submission returned, not that KV was saved.
+  `pool_store_completion` and `pool_events_completed` explicitly use
+  `completion_semantics="bookkeeping_only"`: only backend results establish success.
+  `pool_save_fence` measures the existing released-request fence without assigning
+  it to the later execution. `save_wait` tasks retain the original execution when
+  the final layer's wait is deferred; `wait_returned` is not backend success.
+
+Records contain counts and identities, never prompts, raw cache keys, or addresses.
+Python host intervals can support native-log correlation by host/process/native TID,
+but this implementation does not claim a native `BatchPutTiming` association without
+the corresponding native record.
+
 ## Scenario 1: Mooncake Backend
 
 ### Configuration Examples

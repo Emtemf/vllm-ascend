@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, Slid
 
 from tests.ut.distributed.ascend_store.test_mooncake_hybrid import MemoryRangeStore, cpu_cache
 from tests.ut.distributed.ascend_store.test_pool_worker import make_worker
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import create_kv_pool_scheduler
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import attention_transfer_window
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import mooncake_layerwise as protocol
@@ -104,7 +105,7 @@ class TestMooncakePipeline(unittest.TestCase):
             def run():
                 try:
                     with thread.test_lock:
-                        thread._handle_request(thread.request_queue.get())
+                        thread._dispatch_diagnostic_request(thread.request_queue.get())
                 except Exception as exc:
                     errors.append(exc)
                     thread._fatal_error = exc
@@ -448,6 +449,47 @@ class TestMooncakePipeline(unittest.TestCase):
         self.assertFalse(compute.is_alive())
         self.assertFalse(failures)
         self.assertEqual(len(store.complete), 6)
+
+    def test_empty_tail_save_and_load_emit_complete_group_at_queue_fence(self):
+        store = MemoryRangeStore()
+        worker, _ = self.make_stage(1, store, empty_tail=True)
+        for operation in ("save", "load"):
+            with self.subTest(operation=operation):
+                if operation == "load":
+                    worker.kv_role = "kv_consumer"
+                request = ReqMeta(
+                    "empty-tail-r",
+                    token_len_chunk=64,
+                    block_ids_by_group=[[1, 2, 3, 4], [1, 2], [1, 2, 3, 4]],
+                    block_hashes=[b"h0", b"h1", b"h2", b"h3"],
+                    can_save=operation == "save",
+                    is_last_chunk=True,
+                    load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=64) if operation == "load" else None,
+                    pd_execution_id=f"empty-tail-{operation}",
+                )
+                records = []
+                with patch.object(
+                    pool_diag.diag, "emit", side_effect=lambda event, **fields: records.append((event, fields))
+                ):
+                    self.run_step(worker, request)
+                    # The native event may wake compute just before the dispatch
+                    # scope exits. Join its queue-ordered diagnostic completion,
+                    # without a later execution or shutdown flushing the task.
+                    lane = worker.kv_send_thread if operation == "save" else worker.kv_recv_thread
+                    with lane.test_lock:
+                        pass
+                summaries = [
+                    fields
+                    for event, fields in records
+                    if event == "pool_task" and fields["operation"] == operation
+                ]
+                self.assertEqual(len(summaries), 1)
+                summary = summaries[0]
+                self.assertFalse(summary["incomplete"])
+                self.assertEqual(summary["request_id"], request.req_id)
+                self.assertEqual(summary["execution_id"], request.pd_execution_id)
+                self.assertEqual(summary["counters"]["queue_entries"], 3)
+                self.assertEqual(summary["member_count"], 1)
 
     def test_pp_one_keys_are_unchanged(self):
         self.assertEqual(protocol.make_block_key("model", "hash", 1), "model@hash@1")

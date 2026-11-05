@@ -13,6 +13,7 @@ import torch
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.base import (
     Backend,
     require_aligned_batch_results,
@@ -251,6 +252,7 @@ class LayerBatchBuilder:
             )
         return block_ids_np, block_gvas_np
 
+    @pool_diag.timed("prepare")
     def build_shared(self, task: LayerTransferTask, is_save: bool = True) -> SharedBlockData | None:
         """Pre-compute shared block data that is identical across all layers."""
         if not task.block_ranges:
@@ -444,6 +446,7 @@ class LayerBatchBuilder:
             load_keys=all_load_keys,
         )
 
+    @pool_diag.timed("prepare")
     def build_addrs(
         self,
         shared: SharedBlockData,
@@ -505,6 +508,7 @@ class LayerBatchBuilder:
 
 class KVCacheStoreLayerSendingThreadBase(KVTransferThread):
     """Track pending layer saves by request ID for both layerwise paths."""
+    _diag_operation = "save"
 
     def __init__(
         self,
@@ -571,6 +575,7 @@ class KVCacheStoreKeyLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         self.layer_save_finished_events = layer_save_finished_events
         self.sync_save_events = sync_save_events
 
+    @pool_diag.timed("build_key")
     def build_cached_process_tokens(self, task: LayerTransferTask) -> dict[int, list[tuple[int, int, list]]] | None:
         """Pre-compute process_tokens results for all layers (Key path).
 
@@ -679,8 +684,9 @@ class KVCacheStoreKeyLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             addrs_to_put = [addr_list[index] for index in missing_indices]
             sizes_to_put = [size_list[index] for index in missing_indices]
             if keys_to_put:
-                self.sync_save_events[layer_id].synchronize()
-                self.m_store.put(keys_to_put, addrs_to_put, sizes_to_put)
+                with pool_diag.stage("sync"):
+                    self.sync_save_events[layer_id].synchronize()
+                pool_diag.put(self.m_store, keys_to_put, addrs_to_put, sizes_to_put)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -695,6 +701,7 @@ class KVCacheStoreKeyLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
 
 
 class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
+    _diag_operation = "load"
     def __init__(
         self,
         m_store: Backend,
@@ -784,7 +791,7 @@ class KVCacheStoreKeyLayerRecvingThread(KVTransferThread):
             key_list_c = _circular_shift(key_list, shift)
             addr_list_c = _circular_shift(addr_list, shift)
             size_list_c = _circular_shift(size_list, shift)
-            self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            pool_diag.get(self.m_store, key_list_c, addr_list_c, size_list_c)
 
         if layer_id == self.final_layer_id:
             for req_id, is_last_chunk in zip(req_ids, is_last_chunks):
@@ -903,7 +910,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         active_indices = [index for index, key in enumerate(req_meta.keys) if key in self._active_put_keys]
         active_keys = [req_meta.keys[index] for index in active_indices]
         if active_keys:
-            self.sync_save_events[layer_id].synchronize()
+            with pool_diag.stage("sync"):
+                self.sync_save_events[layer_id].synchronize()
             active_buffers = [req_meta.all_buffers[index] for index in active_indices]
             active_sizes = [req_meta.all_sizes[index] for index in active_indices]
             active_offsets = [req_meta.all_offsets[index] for index in active_indices]
@@ -1003,6 +1011,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
         layer_id = request[0].layer_id
         try:
             if not self._copy_gva_layers(request):
+                pool_diag.outcome("failed")
                 self.save_disabled.set()
                 if self.raise_on_transfer_failure:
                     self._mark_failed_requests([br.request for task in request for br in task.block_ranges])
@@ -1053,7 +1062,8 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
             all_addrs.append(req_meta.addr_array)
             all_sizes.append(req_meta.size_array)
         if has_any_save:
-            self.sync_save_events[physical_layer].synchronize()
+            with pool_diag.stage("sync"):
+                self.sync_save_events[physical_layer].synchronize()
             gvas_array = np.concatenate(all_gvas) if len(all_gvas) > 1 else all_gvas[0]
             addr_array = np.concatenate(all_addrs) if len(all_addrs) > 1 else all_addrs[0]
             size_array = np.concatenate(all_sizes) if len(all_sizes) > 1 else all_sizes[0]
@@ -1094,6 +1104,7 @@ class KVCacheStoreLayerSendingThread(KVCacheStoreLayerSendingThreadBase):
 
 
 class KVCacheStoreLayerRecvingThread(KVTransferThread):
+    _diag_operation = "load"
     def __init__(
         self,
         m_store: Backend,
@@ -1241,7 +1252,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
                     return
                 if self.save_failure_checker is not None:
                     self.save_failure_checker()
-                self.sync_save_events[wait_for_save].synchronize()
+                with pool_diag.stage("sync"):
+                    self.sync_save_events[wait_for_save].synchronize()
                 self.layer_save_finished_events[wait_for_save].clear()
 
             if data.attention_start_gate is not None:
@@ -1296,6 +1308,7 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             return
         try:
             if not self._copy_gva_layers(data):
+                pool_diag.outcome("failed")
                 self.load_disabled.set()
                 self._mark_failed_requests([br.request for task in data.transfer_tasks for br in task.block_ranges])
         except Exception as exc:
@@ -1322,7 +1335,8 @@ class KVCacheStoreLayerRecvingThread(KVTransferThread):
             # Non-saving TP ranks have no D2H task to synchronize the event.
             # Their CPU save-finished signal only means the event was recorded;
             # wait for the NPU work before reusing the local HBM buffer.
-            self.sync_save_events[wait_for_save].synchronize()
+            with pool_diag.stage("sync"):
+                self.sync_save_events[wait_for_save].synchronize()
             logger.debug("Layer save event cleared: layer %d", wait_for_save)
             self.layer_save_finished_events[wait_for_save].clear()
 
