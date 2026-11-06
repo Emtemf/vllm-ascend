@@ -253,6 +253,7 @@ def backend(operation: str, key_count: int, sizes: Any = None, mode: str = "zero
     if call.byte_sizes is not None:
         counts[operation + "_submitted_bytes"] = sum(call.byte_sizes)
     add(**counts)
+    start_wall_ns = time.time_ns() if operation == "mooncake_put" else None
     try:
         with stage("backend_" + operation):
             yield call
@@ -262,6 +263,19 @@ def backend(operation: str, key_count: int, sizes: Any = None, mode: str = "zero
     finally:
         if not call.recorded:
             add(**{operation + "_unknown_result_keys": key_count})
+        if start_wall_ns is not None:
+            end_wall_ns = time.time_ns()
+            local = time.localtime(start_wall_ns // 1_000_000_000)
+            offset = getattr(local, "tm_gmtoff", -(time.altzone if local.tm_isdst > 0 else time.timezone))
+            diag.emit(
+                "pool_native_call",
+                operation=operation,
+                start_wall_ns=start_wall_ns,
+                end_wall_ns=end_wall_ns,
+                wall_utc_offset_seconds=offset,
+                submitted_keys=key_count,
+                submitted_bytes=counts.get(operation + "_submitted_bytes"),
+            )
 
 
 def task(operation: str):

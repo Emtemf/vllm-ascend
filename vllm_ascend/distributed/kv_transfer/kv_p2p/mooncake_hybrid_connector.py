@@ -927,17 +927,18 @@ class KVCacheRecvingThread(threading.Thread):
 
         num_remote_blocks = sum(len(group_block_ids) for group_block_ids in remote_block_ids)  # noqa: F841
         # Check if we have the remote metadata cached.
-        with self.remote_metadata_lock:
-            has_remote_metadata = (
-                remote_engine_id in self.kv_caches_base_addr
-                and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
-            )
-        if not has_remote_metadata:
-            self._get_remote_metadata(remote_host, remote_handshake_port)
-        with self.remote_metadata_lock:
-            remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
-            local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
-            remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+        with diag.span("pd_transfer_meta_fetch", **req_meta["_pd_diag"]["identity"]):
+            with self.remote_metadata_lock:
+                has_remote_metadata = (
+                    remote_engine_id in self.kv_caches_base_addr
+                    and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
+                )
+            if not has_remote_metadata:
+                self._get_remote_metadata(remote_host, remote_handshake_port)
+            with self.remote_metadata_lock:
+                remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
+                local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
+                remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         # With P-side PP the remote worker only owns its stage's
@@ -976,33 +977,34 @@ class KVCacheRecvingThread(threading.Thread):
             )
 
         req_start_time = time.perf_counter()
-        src_list, dst_list, length_list = [], [], []
-        for i in range(self.hma_group_size):
-            if not remote_block_ids[i] or not local_block_ids[i]:
-                continue
-            cur_remote_block_ids = remote_block_ids[i]
-            cur_local_block_ids = local_block_ids[i]
-            if not isinstance(self.kv_cache_specs[i], MambaSpec) and len(cur_local_block_ids) < len(
-                cur_remote_block_ids
-            ):
-                cur_remote_block_ids = cur_remote_block_ids[-len(cur_local_block_ids) :]
-            grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
-                cur_remote_block_ids, cur_local_block_ids
-            )
-            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-                zip(local_addrs, remote_kv_caches_base_addrs)
-            ):
-                if addr_group_arr and i not in addr_group_arr[k]:
+        with diag.span("pd_transfer_prepare", **req_meta["_pd_diag"]["identity"]):
+            src_list, dst_list, length_list = [], [], []
+            for i in range(self.hma_group_size):
+                if not remote_block_ids[i] or not local_block_ids[i]:
                     continue
-                block_len = block_len_arr[k]
-                block_stride = block_stride_arr[k]
-                for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
-                    src = src_layer_base_addr + local_block_id[0] * block_stride
-                    dst = dst_layer_base_addr + remote_block_id[0] * block_stride
-                    length = block_len * len(local_block_id)
-                    src_list.append(src)
-                    dst_list.append(dst)
-                    length_list.append(length)
+                cur_remote_block_ids = remote_block_ids[i]
+                cur_local_block_ids = local_block_ids[i]
+                if not isinstance(self.kv_cache_specs[i], MambaSpec) and len(cur_local_block_ids) < len(
+                    cur_remote_block_ids
+                ):
+                    cur_remote_block_ids = cur_remote_block_ids[-len(cur_local_block_ids) :]
+                grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
+                    cur_remote_block_ids, cur_local_block_ids
+                )
+                for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
+                    zip(local_addrs, remote_kv_caches_base_addrs)
+                ):
+                    if addr_group_arr and i not in addr_group_arr[k]:
+                        continue
+                    block_len = block_len_arr[k]
+                    block_stride = block_stride_arr[k]
+                    for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
+                        src = src_layer_base_addr + local_block_id[0] * block_stride
+                        dst = dst_layer_base_addr + remote_block_id[0] * block_stride
+                        length = block_len * len(local_block_id)
+                        src_list.append(src)
+                        dst_list.append(dst)
+                        length_list.append(length)
 
         ret = self._transfer_batch(req_meta, session_id, src_list, dst_list, length_list, req_start_time)
         if ret < 0:
@@ -1037,13 +1039,14 @@ class KVCacheRecvingThread(threading.Thread):
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         # Check if we have the remote metadata cached.
-        with self.remote_metadata_lock:
-            has_remote_metadata = (
-                remote_engine_id in self.kv_caches_base_addr
-                and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
-            )
-        if not has_remote_metadata:
-            self._get_remote_metadata(remote_host, remote_handshake_port)
+        with diag.span("pd_transfer_meta_fetch", **req_meta["_pd_diag"]["identity"]):
+            with self.remote_metadata_lock:
+                has_remote_metadata = (
+                    remote_engine_id in self.kv_caches_base_addr
+                    and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
+                )
+            if not has_remote_metadata:
+                self._get_remote_metadata(remote_host, remote_handshake_port)
 
         if tp_num_need_pulls == 1:
             grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
@@ -1078,19 +1081,20 @@ class KVCacheRecvingThread(threading.Thread):
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
-        src_list, dst_list, length_list = [], [], []
-        for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-            zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)
-        ):
-            block_len = self.block_len_per_addr[k]
-            inner_block_len = block_len // tp_num_need_pulls
-            for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
-                src = src_layer_base_addr + local_block_id[0] * block_len + inner_offset * inner_block_len
-                dst = dst_layer_base_addr + remote_block_id[0] * inner_block_len
-                length = inner_block_len * len(local_block_id)
-                src_list.append(src)
-                dst_list.append(dst)
-                length_list.append(length)
+        with diag.span("pd_transfer_prepare", **req_meta["_pd_diag"]["identity"]):
+            src_list, dst_list, length_list = [], [], []
+            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
+                zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)
+            ):
+                block_len = self.block_len_per_addr[k]
+                inner_block_len = block_len // tp_num_need_pulls
+                for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
+                    src = src_layer_base_addr + local_block_id[0] * block_len + inner_offset * inner_block_len
+                    dst = dst_layer_base_addr + remote_block_id[0] * inner_block_len
+                    length = inner_block_len * len(local_block_id)
+                    src_list.append(src)
+                    dst_list.append(dst)
+                    length_list.append(length)
 
         ret = self._transfer_batch(req_meta, session_id, src_list, dst_list, length_list, req_start_time)
         if ret < 0:
@@ -1109,16 +1113,17 @@ class KVCacheRecvingThread(threading.Thread):
         need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
         use_fused_op = get_ascend_config().enable_transpose_kv_cache_by_block
         if need_nz_cache or need_cat_cache:
-            # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
-            if use_fused_op and enable_custom_op():
-                if need_cat_cache:
-                    # the fused op only support cat GQA/MHA kv cache by head
-                    self.reformat_kv_cache_with_fused_op(grouped_local_block_ids, tp_num_need_pulls)
-                if need_nz_cache:
-                    # maybe use fused op to reformat kv nz too in the future.
-                    self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
-            else:
-                self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
+            with diag.span("pd_transfer_reformat", **req_meta["_pd_diag"]["identity"]):
+                # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
+                if use_fused_op and enable_custom_op():
+                    if need_cat_cache:
+                        # the fused op only support cat GQA/MHA kv cache by head
+                        self.reformat_kv_cache_with_fused_op(grouped_local_block_ids, tp_num_need_pulls)
+                    if need_nz_cache:
+                        # maybe use fused op to reformat kv nz too in the future.
+                        self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, False, need_nz_cache)
+                else:
+                    self.reformat_kv_cache(grouped_local_block_ids, tp_num_need_pulls, need_cat_cache, need_nz_cache)
 
     def reformat_kv_cache_with_fused_op(self, block_ids: list[list[int]], tp_num_need_pulls: int):
         # Get necessary parameters

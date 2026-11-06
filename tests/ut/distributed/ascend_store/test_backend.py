@@ -105,6 +105,24 @@ class TestPoolDiagnosticResults(unittest.TestCase):
             pool_diag.put(store, ["k"], [[100]], [[8]])
         self.assertIs(raised.exception, failure)
 
+    def test_native_boundary_survives_failed_put_without_changing_exception(self):
+        failure = RuntimeError("native put sentinel")
+        request = SimpleNamespace(req_id="A", pd_execution_id="E")
+        snapshot = pool_diag.capture(request, "save", 2, queued=False)
+        with self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured:
+            with self.assertRaises(RuntimeError) as raised:
+                with pool_diag.processing(snapshot):
+                    with pool_diag.backend("mooncake_put", 1, [[8]], "nonnegative"):
+                        raise failure
+        self.assertIs(raised.exception, failure)
+        records = [json.loads(record.getMessage().split("[PD_DIAG] ", 1)[1]) for record in captured.records]
+        native = next(record for record in records if record["event"] == "pool_native_call")
+        task = next(record for record in records if record["event"] == "pool_task")
+        self.assertEqual(native["task_id"], task["task_id"])
+        self.assertEqual(native["request_id"], "A")
+        self.assertLessEqual(native["start_wall_ns"], native["end_wall_ns"])
+        self.assertEqual(task["status"], "exception")
+
 
 # =========================================================================
 # Backend ABC

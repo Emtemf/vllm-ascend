@@ -118,11 +118,21 @@ or validate business calls.
   `pool_save_fence` measures the existing released-request fence without assigning
   it to the later execution. `save_wait` tasks retain the original execution when
   the final layer's wait is deferred; `wait_returned` is not backend success.
+* In the ordinary path, `wait_for_save` submits a batch without a per-call queue
+  join. `pool_save_fence` observes the existing wait before released requests'
+  source blocks may be reused. These are different boundaries from a backend put
+  or task completion. Layerwise saves still drain at the final layer by default;
+  do not infer ordinary-path behavior from the layerwise connector interface.
 
 Records contain counts and identities, never prompts, raw cache keys, or addresses.
-Python host intervals can support native-log correlation by host/process/native TID,
-but this implementation does not claim a native `BatchPutTiming` association without
-the corresponding native record.
+For whole-key Mooncake put calls, `pool_native_call` adds wall-clock start/end,
+the source UTC offset, submitted counts, and the existing task/thread identity.
+It does not alter call arguments, return objects, exceptions or completion logic.
+The paired report uses these boundaries plus glog native TID/timestamps to
+associate phases with a unique task, reconciling native counts when present.
+Timestamp precision, reused TIDs, overlapping calls, and separate unidentified
+log sources cannot silently select a task. Without boundary evidence, native
+records remain pending. Bounded stage aggregates are not individual call bounds.
 
 ## Scenario 1: Mooncake Backend
 
