@@ -74,7 +74,6 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache as VllmDeepseekV4SWACache
 from vllm.v1.kv_cache_interface import KVCacheSpec
-from vllm.v1.utils import record_function_or_nullcontext
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsv4_attn_kv_dtype
@@ -734,37 +733,27 @@ class DeepseekV4DecoderLayer(nn.Module):
         llama_4_scaling: torch.Tensor | None = None,
         input_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        with record_function_or_nullcontext("deepseek_v4::attention_prepare"):
-            residual = hidden_states.clone()
-            full_num_tokens = positions.shape[0]
-            hidden_states, post, comb = self.hc_pre(
-                hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-            )
-            hidden_states = self.input_layernorm(hidden_states)
+        residual = hidden_states.clone()
+        full_num_tokens = positions.shape[0]
+        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        hidden_states = self.input_layernorm(hidden_states)
 
         if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-            with record_function_or_nullcontext("deepseek_v4::sp_all_gather"):
-                hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
+            hidden_states = sp_all_gather(hidden_states)[:full_num_tokens]
 
-        with record_function_or_nullcontext("deepseek_v4::attention"):
-            attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
-            hidden_states = self.self_attn(**attn_kwargs)
+        attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
+        hidden_states = self.self_attn(**attn_kwargs)
 
         if self.use_sequence_parallel_moe and not self.enable_dsa_cp:
-            with record_function_or_nullcontext("deepseek_v4::sp_reduce_scatter"):
-                hidden_states = sp_reduce_scatter(hidden_states)
+            hidden_states = sp_reduce_scatter(hidden_states)
 
-        with record_function_or_nullcontext("deepseek_v4::attention_residual"):
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        with record_function_or_nullcontext("deepseek_v4::mlp_prepare"):
-            residual = hidden_states.clone()
-            hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
-            hidden_states = self.post_attention_layernorm(hidden_states)
-        with record_function_or_nullcontext("deepseek_v4::mlp_moe"):
-            hidden_states = self.mlp(hidden_states, input_ids)
-        with record_function_or_nullcontext("deepseek_v4::mlp_residual"):
-            hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        residual = hidden_states.clone()
+        hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states, input_ids)
+        hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
         return hidden_states, residual
 
@@ -887,89 +876,83 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        # These scopes describe host submission, not device execution time.
-        with record_function_or_nullcontext("deepseek_v4::model_input"):
-            pp_group = get_pp_group()
-            if pp_group.is_first_rank:
-                if inputs_embeds is not None:
-                    hidden_states = inputs_embeds
-                else:
-                    hidden_states = self.embed_input_ids(input_ids)
-                residual = None
+        pp_group = get_pp_group()
+        if pp_group.is_first_rank:
+            if inputs_embeds is not None:
+                hidden_states = inputs_embeds
             else:
-                assert intermediate_tensors is not None
-                hidden_states = intermediate_tensors["hidden_states"]
-                residual = None
-            aux_hidden_states = get_pp_transport_tensors(
+                hidden_states = self.embed_input_ids(input_ids)
+            residual = None
+        else:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+            residual = None
+        aux_hidden_states = get_pp_transport_tensors(
+            intermediate_tensors,
+            PPTransportDataType.AUX_HIDDEN_STATES,
+        )
+
+        if self.use_sequence_parallel_moe:
+            if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+                forward_context = get_forward_context()
+                forward_context.is_padding = sp_padding_mask(forward_context.is_padding, hidden_states)
+            hidden_states = sp_shard(hidden_states)
+            input_ids = sp_shard(input_ids)  # TODO: support PP with dsacp.
+
+        # Compute llama 4 scaling once per forward pass if enabled
+        llama_4_scaling_config = None
+        llama_4_scaling: torch.Tensor | None
+        if llama_4_scaling_config is not None:
+            llama_4_scaling = _get_llama_4_scaling(
+                original_max_position_embeddings=llama_4_scaling_config["original_max_position_embeddings"],
+                scaling_beta=llama_4_scaling_config["beta"],
+                positions=positions,
+            )
+        else:
+            llama_4_scaling = None
+
+        if pp_group.is_first_rank:
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                residual,
+                llama_4_scaling,
+                input_ids=input_ids,
+            )
+            if layer.layer_idx + 1 in self.aux_hidden_state_layers:
+                aux_hidden_state = hidden_states.mean(dim=1)
+                if self.use_sequence_parallel_moe:
+                    aux_hidden_state = sp_all_gather(aux_hidden_state)[: positions.shape[0]]
+                aux_hidden_states.append(aux_hidden_state)
+
+        if not pp_group.is_last_rank:
+            intermediate_tensors = IntermediateTensors(
+                {
+                    "hidden_states": hidden_states,
+                }
+            )
+            return add_pp_transport_tensors(
                 intermediate_tensors,
                 PPTransportDataType.AUX_HIDDEN_STATES,
+                aux_hidden_states,
             )
 
-            if self.use_sequence_parallel_moe:
-                if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
-                    forward_context = get_forward_context()
-                    forward_context.is_padding = sp_padding_mask(forward_context.is_padding, hidden_states)
-                hidden_states = sp_shard(hidden_states)
-                input_ids = sp_shard(input_ids)  # TODO: support PP with dsacp.
+        if self.use_sequence_parallel_moe:
+            hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
 
-            # Compute llama 4 scaling once per forward pass if enabled
-            llama_4_scaling_config = None
-            llama_4_scaling: torch.Tensor | None
-            if llama_4_scaling_config is not None:
-                llama_4_scaling = _get_llama_4_scaling(
-                    original_max_position_embeddings=llama_4_scaling_config["original_max_position_embeddings"],
-                    scaling_beta=llama_4_scaling_config["beta"],
-                    positions=positions,
-                )
-            else:
-                llama_4_scaling = None
+        # Stash pre-hc_head residual for the MTP draft (captured copy_).
+        if self._mtp_hidden_buffer is not None:
+            num_tokens = hidden_states.shape[0]
+            self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-            if pp_group.is_first_rank:
-                hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-        with record_function_or_nullcontext("deepseek_v4::layer_loop"):
-            for layer in islice(self.layers, self.start_layer, self.end_layer):
-                hidden_states, residual = layer(
-                    positions,
-                    hidden_states,
-                    residual,
-                    llama_4_scaling,
-                    input_ids=input_ids,
-                )
-                if layer.layer_idx + 1 in self.aux_hidden_state_layers:
-                    aux_hidden_state = hidden_states.mean(dim=1)
-                    if self.use_sequence_parallel_moe:
-                        with record_function_or_nullcontext("deepseek_v4::aux_sp_all_gather"):
-                            aux_hidden_state = sp_all_gather(aux_hidden_state)[: positions.shape[0]]
-                    aux_hidden_states.append(aux_hidden_state)
+        hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
-        with record_function_or_nullcontext("deepseek_v4::model_output"):
-            if not pp_group.is_last_rank:
-                intermediate_tensors = IntermediateTensors(
-                    {
-                        "hidden_states": hidden_states,
-                    }
-                )
-                return add_pp_transport_tensors(
-                    intermediate_tensors,
-                    PPTransportDataType.AUX_HIDDEN_STATES,
-                    aux_hidden_states,
-                )
-
-            if self.use_sequence_parallel_moe:
-                with record_function_or_nullcontext("deepseek_v4::output_sp_all_gather"):
-                    hidden_states = sp_all_gather(hidden_states)[: positions.shape[0]]
-
-            # Stash pre-hc_head residual for the MTP draft (captured copy_).
-            if self._mtp_hidden_buffer is not None:
-                num_tokens = hidden_states.shape[0]
-                self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-
-            hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
-
-            hidden_states = self.norm(hidden_states)
-            if len(aux_hidden_states) > 0:
-                return hidden_states, aux_hidden_states
-            return hidden_states
+        hidden_states = self.norm(hidden_states)
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
+        return hidden_states
 
 
 class DeepseekV2MixtureOfExperts(MixtureOfExperts):

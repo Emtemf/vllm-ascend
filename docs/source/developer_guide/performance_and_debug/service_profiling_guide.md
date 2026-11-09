@@ -114,45 +114,6 @@ After analysis, the `*ascend_pt` directory will contain many files, with the mai
 
 - `trace_view.json`: Chrome tracing format data, can be opened with [MindStudio Insight](https://www.hiascend.com/document/detail/zh/mindstudio/81RC1/GUI_baseddevelopmenttool/msascendinsightug/Insight_userguide_0002.html)
 
-### DeepSeek V4 Semantic Host Scopes
-
-Set `VLLM_CUSTOM_SCOPES_FOR_PROFILING=1` **before starting each worker process**
-to enable the existing `record_function_or_nullcontext` helper's PyTorch
-`record_function` scopes. Collect an Ascend PyTorch profile as described above.
-The helper caches its backend on first use; changing the environment after the
-worker has started does not switch that backend. With both custom and NVTX
-scopes disabled, the helper uses a null context. The existing
-`VLLM_NVTX_SCOPES_FOR_PROFILING` option selects NVTX instead when custom scopes
-are disabled; it is not required for Ascend PyTorch collection.
-
-DeepSeek V4 uses a bounded set of static labels, shared across decoder layers:
-
-| Scope | Host-side submission region |
-|:------|:----------------------------|
-| `deepseek_v4::model_input` | Embedding or PP input, optional local SP sharding, and hyperconnection input expansion |
-| `deepseek_v4::layer_loop` | Decoder calls and auxiliary hidden-state collection |
-| `deepseek_v4::model_output` | PP output or final gather, optional MTP buffer copy, head, and normalization |
-| `deepseek_v4::attention_prepare` / `attention_residual` | Attention hyperconnection preparation/normalization and residual merge |
-| `deepseek_v4::attention` | Attention call |
-| `deepseek_v4::mlp_prepare` / `mlp_residual` | MLP hyperconnection preparation/normalization and residual merge |
-| `deepseek_v4::mlp_moe` | MLP/MoE call |
-| `deepseek_v4::sp_all_gather` / `sp_reduce_scatter` | Existing decoder SP collective calls, when enabled without DSA context parallelism |
-| `deepseek_v4::aux_sp_all_gather` / `output_sp_all_gather` | Existing auxiliary-output and final-output SP gathers |
-
-Every abbreviated label in the table retains the `deepseek_v4::` prefix.
-Scopes identify **host submission spans**, not elapsed NPU execution time.
-Use the profiler's device kernels and communication tracks to inspect actual
-device work; scopes do not add synchronization. Parent scopes contain child
-scopes, so their durations must not be added together.
-
-These scopes are visible when the corresponding Python forward code executes
-under an enabled profiler, particularly in eager execution. The existing
-`@support_torch_compile` decoration and graph paths are unchanged: compilation
-may ignore or transform Python profiler scopes, and graph replay does **not**
-promise fresh Python scope events for every replay. Use device profiling for
-compiled/replayed work. Static labels do not encode request IDs or layer
-indices and must not be treated as per-request wall-clock residual accounting.
-
 ### Supplementary: Profiling in PD Disaggregation Scenarios
 
 In PD (Prefill-Decode) disaggregation deployments, the Prefiller and Decoder are **separate vLLM instances**, each with its own API server. Profiling must be configured and controlled **independently** on each node:
