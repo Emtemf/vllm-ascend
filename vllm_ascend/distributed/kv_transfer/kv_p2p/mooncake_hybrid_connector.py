@@ -602,8 +602,12 @@ class KVCacheRecvingThread(threading.Thread):
             summary = self.pd_request_tasks.get(request_id)
             if summary is None:
                 summary = {
+                    "request_id": request_id,
+                    "tp_rank": self.tp_rank,
+                    "dp_rank": self.vllm_config.parallel_config.data_parallel_rank,
                     "request_generation": diag.new_id("pd_request"),
                     "pending_tasks": 0,
+                    "final_task_queued": False,
                     "submitted_tasks": 0,
                     "succeeded_tasks": 0,
                     "failed_tasks": 0,
@@ -611,7 +615,8 @@ class KVCacheRecvingThread(threading.Thread):
                     "submitted_bytes": 0,
                     "succeeded_bytes": 0,
                     "failed_bytes": 0,
-                    "final_task_queued": False,
+                    "transfer_start_ns": None,
+                    "transfer_end_ns": None,
                     "tracker_completed": False,
                 }
                 self.pd_request_tasks[request_id] = summary
@@ -822,12 +827,21 @@ class KVCacheRecvingThread(threading.Thread):
             # carry those identities; do not attribute the whole request to the last.
             diag.emit(
                 "pd_transfer_request_finished",
-                **completed,
+                **{
+                    key: value
+                    for key, value in completed.items()
+                    if key not in ("transfer_start_ns", "transfer_end_ns")
+                },
                 status=request_status,
                 task_id=None,
                 execution_id=None,
                 remote_engine_id=None,
                 offset=None,
+                transfer_duration_ns=(
+                    completed["transfer_end_ns"] - completed["transfer_start_ns"]
+                    if completed["transfer_start_ns"] is not None
+                    else None
+                ),
             )
 
     def _transfer_batch(
@@ -854,7 +868,7 @@ class KVCacheRecvingThread(threading.Thread):
         ret = None
         status = "failed"
         error_type = None
-        start_ns = time.perf_counter_ns()
+        start_ns = time.monotonic_ns()
         try:
             ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
             status = "failed" if ret < 0 else ("succeeded" if segments else "no_work")
@@ -865,12 +879,20 @@ class KVCacheRecvingThread(threading.Thread):
             raise
         finally:
             end_time = time.perf_counter()
-            end_ns = time.perf_counter_ns()
+            end_ns = time.monotonic_ns()
             succeeded_bytes = submitted_bytes if status == "succeeded" else 0
             failed_bytes = submitted_bytes if status in ("failed", "cancelled") else 0
             task["succeeded_bytes"] += succeeded_bytes
             task["failed_bytes"] += failed_bytes
             task["transfer_status"] = status
+            with self.request_task_counts_lock:
+                summary = self.pd_request_tasks.get(req_meta["request_id"])
+                if summary is not None:
+                    if summary["transfer_start_ns"] is None:
+                        summary["transfer_start_ns"] = start_ns
+                    else:
+                        summary["transfer_start_ns"] = min(summary["transfer_start_ns"], start_ns)
+                    summary["transfer_end_ns"] = max(summary["transfer_end_ns"] or end_ns, end_ns)
             diag.emit(
                 "pd_transfer_batch_finished",
                 **task["identity"],
