@@ -23,7 +23,6 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
-from vllm.v1.metrics import pd_diagnostics as diag
 
 from vllm_ascend.ascend_config import KVPPConfig
 from vllm_ascend.core.kv_cache_placement import map_kvpp_layers_to_owners
@@ -854,7 +853,9 @@ class KVPoolWorker:
         if len(metadata.requests) == 0:
             return
         for request in metadata.requests:
-            with pool_diag.processing(pool_diag.capture(request, "load_submit" if self.load_async else "load", self.tp_rank, queued=False)):
+            with pool_diag.processing(
+                pool_diag.capture(request, "load_submit" if self.load_async else "load", self.tp_rank, queued=False)
+            ):
                 load_spec = request.load_spec
                 if load_spec is None or not load_spec.can_load:  # load =0
                     pool_diag.outcome("missing_load_spec" if load_spec is None else "skipped")
@@ -891,7 +892,7 @@ class KVPoolWorker:
                     )
                     pool_diag.outcome("submission_returned")
                     continue
-        
+
                 if self.tp_mismatch:
                     # TP mismatch is restricted to non-hybrid, single-group KV.
                     group_block_size = self.grouped_block_size[0]
@@ -905,7 +906,7 @@ class KVPoolWorker:
                     if loaded is False:
                         self._record_failed_request(request)
                     continue
-        
+
                 addr_list = []
                 size_list = []
                 key_list = []
@@ -918,10 +919,10 @@ class KVPoolWorker:
                     group_block_size = self.grouped_block_size[group_id]
                     mask_num = load_spec.vllm_cached_tokens // group_block_size * group_block_size
                     skip_null = group_id < len(self.group_uses_align_state) and self.group_uses_align_state[group_id]
-        
+
                     def chunk_filter(start: int, group_id=group_id, load_masks=load_masks) -> bool:
                         return self.token_database.mask_allows_chunk(load_masks, group_id, start)
-        
+
                     for (
                         start,
                         end,
@@ -1070,9 +1071,7 @@ class KVPoolWorker:
             return
         send_thread.raise_if_failed()
         if isinstance(send_thread, KVCacheStoreSendingThread):
-            with diag.span("pool_save_fence", request_id=None, execution_id=None,
-                           request_ids=sorted(released_req_ids or ()), tp_rank=self.tp_rank):
-                send_thread.wait_for_requests_saved(released_req_ids)
+            send_thread.wait_for_requests_saved(released_req_ids)
         # Layerwise saves are already synchronized at each step's final layer.
 
     @pool_diag.task("save_submit")
@@ -1105,9 +1104,6 @@ class KVPoolWorker:
         with pool_diag.stage("queue_submission"):
             self._previous_save_batch = send_thread.add_save_batch(requests)
         pool_diag.outcome("submission_returned")
-        diag.emit("pool_save_submission", execution_id=connector_metadata.pd_execution_id,
-                  request_id=None, request_ids=[request.req_id for request in requests],
-                  tp_rank=self.tp_rank, request_count=len(requests), status="submission_returned")
 
     def _make_sub_key_str(self, base_key: str, effective_rank: int) -> str:
         """Rewrite ``@head_or_tp_rank:<local>`` in serialized ``base_key`` to ``<effective_rank>``.
@@ -1797,7 +1793,5 @@ class KVPoolWorker:
     def build_connector_worker_meta(self) -> AscendStoreKVConnectorWorkerMetadata | None:
         if isinstance(self.kv_send_thread, KVCacheStoreSendingThread):
             if ce := self.kv_send_thread.get_completed_events():
-                diag.emit("pool_events_completed", execution_id=None, request_id=None, tp_rank=self.tp_rank,
-                          event_count=len(ce), completion_count=sum(ce.values()), completion_semantics="bookkeeping_only")
                 return AscendStoreKVConnectorWorkerMetadata(ce)
         return None

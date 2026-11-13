@@ -12,7 +12,6 @@ import numpy as np
 from vllm.distributed.kv_events import BlockStored
 from vllm.logger import logger
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
-from vllm.v1.metrics import pd_diagnostics as diag
 
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.attention_fence import AttentionComputeStartGate
@@ -157,8 +156,10 @@ class KVTransferThread(threading.Thread):
         task = None
         if layer_id is not None:
             executions = tuple(sorted({str(dict(member).get("execution_id")) for member in snapshot.members}))
-            key = executions if executions != ("None",) else tuple(
-                sorted(str(dict(member).get("request_id")) for member in snapshot.members)
+            key = (
+                executions
+                if executions != ("None",)
+                else tuple(sorted(str(dict(member).get("request_id")) for member in snapshot.members))
             )
             if not snapshot.members and self._diagnostic_layer_task is not None:
                 # A reuse-only load still belongs to the preceding queued batch.
@@ -545,6 +546,7 @@ SAVE_REQUEST_POLL_INTERVAL_S = 0.001
 
 class KVCacheStoreSendingThread(KVTransferThread):
     _diag_operation = "save"
+
     def __init__(
         self,
         m_store: Backend,
@@ -720,9 +722,13 @@ class KVCacheStoreSendingThread(KVTransferThread):
             if remaining == 0:
                 del self.stored_requests[req_meta.req_id]
         pool_diag.add(completed_store_jobs=1)
-        diag.emit("pool_store_completion", request_id=req_meta.req_id, execution_id=req_meta.pd_execution_id,
-                  store_job_id=req_meta.store_job_id, tp_rank=self.tp_rank, remaining_jobs=remaining,
-                  completion_semantics="bookkeeping_only")
+        pool_diag.completion(
+            request_id=req_meta.req_id,
+            execution_id=req_meta.pd_execution_id,
+            store_job_id=req_meta.store_job_id,
+            tp_rank=self.tp_rank,
+            remaining_jobs=remaining,
+        )
         return remaining
 
     def delete_finished_stored_request(self, req_id: str):
@@ -1120,6 +1126,7 @@ class KVCacheStoreSendingThread(KVTransferThread):
 
 class KVCacheStoreRecvingThread(KVTransferThread):
     _diag_operation = "load"
+
     def __init__(
         self,
         m_store: Backend,

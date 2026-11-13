@@ -3,6 +3,7 @@
 
 """Exercise actual worker sessions/range I/O with distinct bytes on every stage."""
 
+import json
 import threading
 import unittest
 from copy import copy, deepcopy
@@ -467,10 +468,7 @@ class TestMooncakePipeline(unittest.TestCase):
                     load_spec=LoadSpec(vllm_cached_tokens=0, kvpool_cached_tokens=64) if operation == "load" else None,
                     pd_execution_id=f"empty-tail-{operation}",
                 )
-                records = []
-                with patch.object(
-                    pool_diag.diag, "emit", side_effect=lambda event, **fields: records.append((event, fields))
-                ):
+                with self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured:
                     self.run_step(worker, request)
                     # The native event may wake compute just before the dispatch
                     # scope exits. Join its queue-ordered diagnostic completion,
@@ -478,13 +476,14 @@ class TestMooncakePipeline(unittest.TestCase):
                     lane = worker.kv_send_thread if operation == "save" else worker.kv_recv_thread
                     with lane.test_lock:
                         pass
+                records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
                 summaries = [
-                    fields
-                    for event, fields in records
-                    if event == "pool_task" and fields["operation"] == operation
+                    record for record in records if record["event"] == "pool_task" and record["operation"] == operation
                 ]
                 self.assertEqual(len(summaries), 1)
                 summary = summaries[0]
+                self.assertEqual(summary["version"], 2)
+                self.assertEqual(set(summary["stages"]), {"build_key", "lookup", "prepare", "sync", "put"})
                 self.assertFalse(summary["incomplete"])
                 self.assertEqual(summary["request_id"], request.req_id)
                 self.assertEqual(summary["execution_id"], request.pd_execution_id)

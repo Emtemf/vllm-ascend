@@ -33,10 +33,9 @@ from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import round_up
 from vllm.utils.torch_utils import async_tensor_h2d as async_copy_to_gpu
-from vllm.v1.metrics import pd_diagnostics as diag
-from vllm.v1.worker.worker_base import pd_execution, pd_sample
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.worker.dp_utils import skip_dp_coordination
 from vllm.v1.worker.gpu import model_runner as vllm_model_runner
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -54,6 +53,7 @@ from vllm.v1.worker.gpu.model_runner import (
     GPUModelRunner,
 )
 from vllm.v1.worker.gpu.model_states.mamba_hybrid import MambaHybridModelState
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import (
@@ -1211,8 +1211,7 @@ class NPUModelRunner(GPUModelRunner):
             capacity,
             "max_num_reqs * decode_query_len",
         )
-        with diag.span("runner.logits", completion="host_return"):
-            logits = self.model.compute_logits(hidden_states[sample_indices])
+        logits = self.model.compute_logits(hidden_states[sample_indices])
         logits = logits[:num_logits]
 
         # Dispatch tail mirrors GPUModelRunner.sample; refresh it on main bumps.

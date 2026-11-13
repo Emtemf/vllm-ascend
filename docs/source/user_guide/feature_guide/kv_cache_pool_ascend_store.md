@@ -1716,6 +1716,42 @@ QoS can be configured through `kv_connector_extra_config`, which is injected int
 
 Values in `kv_connector_extra_config` take precedence over environment variables; a WARN log is emitted on override. For the Mooncake backend, `qos_priority` is merged into existing `ASCEND_GLOBAL_RESOURCE_CONFIG` (other fields preserved). When `ASCEND_GLOBAL_RESOURCE_CONFIG` was not set, configuring `qos_priority` also creates it.
 
+## Compact TTFT diagnostics (schema 2)
+
+The isolated compact TTFT integration emits `[PD_DIAG]` JSON with `version: 2`.
+It requires matching vLLM diagnostic helpers and the schema-2 reader; it does
+not emit or reconstruct schema-1 leaf records. Official request statistics and
+the existing transfer, synchronization and completion order are unchanged.
+
+`pool_task` describes the existing submission, background save/load, shared
+preparation, or final layerwise `save_wait` scope. Only `build_key`, `lookup`,
+`prepare`, `sync`, and `put` are display stages. Queue waits, backend calls,
+processing envelopes and final save fences remain associated evidence rather
+than additional display stages. Repeated durations sum actual invocations,
+including real zero; skipped or unmeasured stages have no measured duration.
+Members freeze request/execution and available observation/generation/job
+identity at submission. Each task retains at most 128 members, 64 native calls
+and 128 bookkeeping completions. Dropped detail is counted and marks the record
+incomplete; bookkeeping completion does not establish backend success.
+
+Mooncake hybrid receive diagnostics use separate `pd_transfer_summary` records
+for each task, request-generation closure and explicit producer/consumer link.
+`submit` measures actual remote metadata requests (cached metadata is skipped),
+and `wait_for_transfer` sums actual synchronous native READ calls.
+`transfer_envelope_ns` is separate, includes gaps between READ calls, and is
+neither a task sum nor pure waiting time. Native samples preserve the calling
+native thread ID, monotonic and wall-clock windows, UTC offset and call ID.
+Cross-process matching needs explicit process/run provenance or the same log
+source, thread identity and an unambiguous wall-clock window; monotonic clocks
+must not be compared across processes or runs. Submitted byte counts describe
+requested lengths, not measured wire traffic or per-segment completion.
+
+CPU diagnostic fixtures do not validate NPU serving, native cross-process
+transfer correctness, model output, production Decode behavior or performance.
+Those remain unverified for this compact integration until exercised on the
+matched deployment revisions and runtime. No extra device synchronization,
+request wait or service lifecycle change is introduced by diagnostics.
+
 ## FAQ
 
 For common environment, installation, and general parameter issues, see the [Public FAQ](../../faqs.md). This chapter only covers issues specific to this feature.

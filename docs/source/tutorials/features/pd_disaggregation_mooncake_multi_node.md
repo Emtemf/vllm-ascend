@@ -1361,3 +1361,32 @@ curl http://192.0.0.1:8080/v1/completions \
         "temperature": 0
     }'
 ```
+
+## Compact TTFT diagnostics
+
+The isolated compact-diagnostics integration emits `[PD_DIAG]` schema 2 only;
+use matching vLLM, vLLM-Ascend, Mooncake and schema-2 reader revisions. It has
+no schema-1 compatibility mode. Worker summaries retain forward, sampling and
+KV load/save entry timings without changing profiler scopes or native stats.
+
+Pool work emits one `pool_task` per existing task completion. Retained stages
+are `build_key`, `lookup`, `prepare`, `sync`, `put`, and the actual final
+layerwise `save_wait`; missing measurements carry status rather than a made-up
+duration. Original auxiliary timers remain associated evidence. Members are
+limited to 128, native call windows to 64 and bookkeeping completions to 128.
+Dropped counts mark the summary incomplete. `store_job_id=-1` is not a unique
+job identity, and bookkeeping completion is not proof of backend success.
+Native PUT wall-call windows, UTC offsets, native thread IDs and call IDs are
+embedded in the owning task for Mooncake native-source correlation.
+
+Hybrid receive tasks emit `pd_transfer_summary` with frozen local/remote,
+execution and request-generation identities. Metadata requests and address
+preparation remain `associated_stages`, not a second `submit` stage.
+Worker `submit` measures the `start_load_kv` call; receive-task
+`wait_for_transfer` sums actual READ calls, not
+the queue or whole-task envelope. At most 64 native READ details are retained;
+truncation is explicit. Queue difference and reformat timing are associated
+evidence. A separate `scope=request_generation` closure reports counters and
+the READ envelope, not a pure-wait measurement or sum of task durations.
+Producer/consumer links use compact `scope=link` summaries. Diagnostics add
+no device synchronization or inference wait.

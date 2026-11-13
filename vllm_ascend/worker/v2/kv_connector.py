@@ -4,7 +4,6 @@
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.worker.gpu.kv_connector import KVConnector
 
 if TYPE_CHECKING:
@@ -25,8 +24,7 @@ class MambaCopyKVConnector(KVConnector):
 
     def pre_forward(self, scheduler_output: "SchedulerOutput", *args: Any, **kwargs: Any) -> None:
         self._connector.pre_forward(scheduler_output, *args, **kwargs)
-        with diag.span("kv.mamba_state_copy", completion="host_return"):
-            self._copy_mamba_state()
+        self._copy_mamba_state()
 
     def finish_forward(self) -> None:
         self._connector.finish_forward()

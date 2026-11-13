@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import json
 import queue
 import threading
 import unittest
@@ -2147,7 +2148,7 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
                     sender.final_layer_id = 2
                     sender.layer_offset = 0
                     key = SimpleNamespace(split_layers=lambda count, offset: ["layer-0", "layer-1", "layer-2"])
-                    sender.token_database = SimpleNamespace(process_tokens=lambda *args: iter([(0, 16, key)]))
+                    sender.token_database = SimpleNamespace(process_tokens=lambda *args, key=key: iter([(0, 16, key)]))
                 receiver = object.__new__(KVCacheStoreLayerRecvingThread)
                 receiver.group_builders = [LayerBatchBuilder(database, page_size_bytes=24, num_layers=3)]
                 worker.kv_send_thread = sender
@@ -2157,27 +2158,29 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
                 worker._prepare_load_gvas = lambda requests: None
                 worker._alloc_gvas_for_save = lambda requests: None
 
-                def populate(tasks, layer):
+                def populate(tasks, layer, request=request):
                     if layer < 2:
                         tasks[layer].append(LayerTransferTask(layer, [LayerBlockRange(request, 0, 1)]))
 
-                worker._process_save_for_layer_batch = lambda requests, layer, *args: populate(
-                    worker.layer_save_tasks, layer
-                )
-                worker._process_load_for_layer_batch = lambda requests, layer, *args: (
-                    populate(worker.layer_load_tasks, layer) if path == "gva" else None
-                )
-                records = []
-                with patch.object(
-                    pool_diag.diag, "emit", side_effect=lambda event, **fields: records.append((event, fields))
-                ):
+                def prepare_save(requests, layer, *args, worker=worker, populate=populate):
+                    return populate(worker.layer_save_tasks, layer)
+
+                def prepare_load(requests, layer, *args, worker=worker, path=path, populate=populate):
+                    return populate(worker.layer_load_tasks, layer) if path == "gva" else None
+
+                worker._process_save_for_layer_batch = prepare_save
+                worker._process_load_for_layer_batch = prepare_load
+                with self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured:
                     worker.process_layer_data([request])
 
-                summaries = [fields for event, fields in records if event == "pool_task"]
+                records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+                summaries = [record for record in records if record["event"] == "pool_task"]
                 self.assertEqual(len(summaries), 2 if path == "gva" else 1)
                 expected = {"save_prepare", "load_prepare"} if path == "gva" else {"save_key_prepare"}
                 self.assertEqual({summary["operation"] for summary in summaries}, expected)
                 for summary in summaries:
+                    self.assertEqual(summary["version"], 2)
+                    self.assertEqual(set(summary["stages"]), {"build_key", "lookup", "prepare", "sync", "put"})
                     self.assertEqual(summary["request_id"], request.req_id)
                     self.assertEqual(summary["execution_id"], request.pd_execution_id)
                     self.assertEqual(summary["member_count"], 1)

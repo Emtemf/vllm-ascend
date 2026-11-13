@@ -85,6 +85,31 @@ DONE_RECVING_MSG = b"done_recving_msg"
 # number of peers is larger than max_workers. Yield after a small FIFO batch so
 # other peers already waiting in the global executor queue can make progress.
 MAX_REQUESTS_PER_PEER_HANDLER = 5
+MAX_TRANSFER_NATIVE_CALLS = 64
+
+
+@contextlib.contextmanager
+def _pd_transfer_stage(req_meta: dict[str, Any], name: str):
+    """Keep ancillary host timings within the owning receive task."""
+    task = req_meta["_pd_diag"]
+    started = time.monotonic_ns()
+    failed = False
+    try:
+        yield
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        ended = time.monotonic_ns()
+        metric = task["associated_stages"].setdefault(
+            name, {"calls": 0, "duration_ns": 0, "exceptions": 0, "start_ns": started, "end_ns": ended, "status": "ok"}
+        )
+        metric["calls"] += 1
+        metric["duration_ns"] += ended - started
+        metric["end_ns"] = ended
+        metric["exceptions"] += int(failed)
+        if failed:
+            metric["status"] = "exception"
 
 
 class RemotePortInfo(TypedDict):
@@ -618,6 +643,7 @@ class KVCacheRecvingThread(threading.Thread):
                     "transfer_start_ns": None,
                     "transfer_end_ns": None,
                     "tracker_completed": False,
+                    "native_calls_dropped": 0,
                 }
                 self.pd_request_tasks[request_id] = summary
             summary["pending_tasks"] += 1
@@ -631,8 +657,15 @@ class KVCacheRecvingThread(threading.Thread):
             "succeeded_bytes": 0,
             "failed_bytes": 0,
             "transfer_status": "not_submitted",
+            "batch": diag.Batch("pd_transfer_summary", scope="task", **identity),
+            "native_calls": [],
+            "native_calls_dropped": 0,
+            "associated_stages": {},
+            "native_call_count": 0,
+            "transfer_start_ns": None,
+            "transfer_end_ns": None,
         }
-        diag.emit("pd_transfer_task_queued", **identity, final_task=all_task_done)
+        request_data["_pd_diag"]["batch"].add_link("producer", request_id=remote_request_id, engine_id=remote_engine_id)
         self.request_queue.put(request_data)
 
     def get_and_clear_finished_requests(self) -> set[str]:
@@ -659,6 +692,7 @@ class KVCacheRecvingThread(threading.Thread):
 
     def _submit_request(self, request_data: dict[str, Any]) -> None:
         peer_key = (request_data["remote_host"], request_data["remote_handshake_port"])
+        request_data["_pd_diag"]["submitted_ns"] = time.monotonic_ns()
         self._mark_request_task_submitted(request_data)
         should_start_worker = False
         with self.peer_request_queues_lock:
@@ -666,12 +700,6 @@ class KVCacheRecvingThread(threading.Thread):
             if peer_key not in self.active_peer_request_handlers:
                 self.active_peer_request_handlers.add(peer_key)
                 should_start_worker = True
-        diag.emit(
-            "pd_transfer_task_submitted",
-            **request_data["_pd_diag"]["identity"],
-            submitted_ns=time.monotonic_ns(),
-            submission_scope="peer_queue",
-        )
 
         if should_start_worker:
             self.executor.submit(self._handle_peer_requests, peer_key)
@@ -745,12 +773,13 @@ class KVCacheRecvingThread(threading.Thread):
         status = "interrupted"
         error_type = None
         tracker_completed = False
-        with diag.scope(**task["identity"]):
-            diag.emit(
-                "pd_transfer_task_started",
+        with diag.scope(**task["identity"]), diag.collect(task["batch"]):
+            task["batch"].update(
                 start_ns=start_ns,
                 queued_ns=task["queued_ns"],
+                submitted_ns=task.get("submitted_ns"),
                 queue_wait_ns=start_ns - task["queued_ns"],
+                final_task=all_task_done,
             )
             try:
                 try:
@@ -795,18 +824,35 @@ class KVCacheRecvingThread(threading.Thread):
     ) -> None:
         task = req_meta["_pd_diag"]
         end_ns = time.monotonic_ns()
-        diag.emit(
-            "pd_transfer_task_finished",
+        record = task["batch"]
+        if not task["native_call_count"]:
+            record.add_stage(
+                "wait_for_transfer",
+                calls=0,
+                status=("skipped" if task["transfer_status"] in ("skipped", "no_work") else "unmeasured"),
+            )
+        record.finish(
             status=status,
             error_type=error_type,
-            start_ns=start_ns,
             end_ns=end_ns,
-            duration_ns=end_ns - start_ns,
+            processing_duration_ns=end_ns - start_ns,
+            timing_scope="task_processing_envelope",
+            transfer_envelope_ns=(
+                task["transfer_end_ns"] - task["transfer_start_ns"] if task["transfer_start_ns"] is not None else None
+            ),
+            transfer_timing_scope="native_read_envelope_not_call_sum",
             submitted_bytes=task["submitted_bytes"],
             succeeded_bytes=task["succeeded_bytes"],
             failed_bytes=task["failed_bytes"],
             transfer_status=task["transfer_status"],
             tracker_completed=tracker_completed,
+            native_calls=task["native_calls"],
+            native_calls_limit=MAX_TRANSFER_NATIVE_CALLS,
+            native_call_count=task["native_call_count"],
+            native_calls_dropped=task["native_calls_dropped"],
+            associated_stages=task["associated_stages"],
+            incomplete=bool(task["native_calls_dropped"]),
+            complete=not task["native_calls_dropped"],
         )
         completed = None
         with self.request_task_counts_lock:
@@ -817,31 +863,42 @@ class KVCacheRecvingThread(threading.Thread):
             summary[f"{result}_tasks"] += 1
             for key in ("submitted_bytes", "succeeded_bytes", "failed_bytes"):
                 summary[key] += task[key]
+            summary["native_calls_dropped"] += task["native_calls_dropped"]
             if summary["pending_tasks"] == 0 and summary["final_task_queued"]:
                 completed = self.pd_request_tasks.pop(req_meta["request_id"])
         if completed is not None:
-            request_status = "failed" if completed["failed_tasks"] else (
-                "skipped" if completed["skipped_tasks"] == completed["submitted_tasks"] else "succeeded"
+            request_status = (
+                "failed"
+                if completed["failed_tasks"]
+                else ("skipped" if completed["skipped_tasks"] == completed["submitted_tasks"] else "succeeded")
             )
             # A request can span several executions and remote engines. Task events
             # carry those identities; do not attribute the whole request to the last.
             diag.emit(
-                "pd_transfer_request_finished",
+                "pd_transfer_summary",
                 **{
                     key: value
                     for key, value in completed.items()
                     if key not in ("transfer_start_ns", "transfer_end_ns")
                 },
                 status=request_status,
+                scope="request_generation",
+                connector_id=self.pd_connector_id,
+                engine_id=self.local_engine_id,
+                remote_request_id=None,
                 task_id=None,
                 execution_id=None,
+                observation_id=None,
                 remote_engine_id=None,
                 offset=None,
-                transfer_duration_ns=(
+                transfer_envelope_ns=(
                     completed["transfer_end_ns"] - completed["transfer_start_ns"]
                     if completed["transfer_start_ns"] is not None
                     else None
                 ),
+                timing_scope="native_read_envelope_not_task_sum_or_pure_wait",
+                complete=not completed["native_calls_dropped"],
+                incomplete=bool(completed["native_calls_dropped"]),
             )
 
     def _transfer_batch(
@@ -858,16 +915,11 @@ class KVCacheRecvingThread(threading.Thread):
         submitted_bytes = sum(length_list)
         segments = len(length_list)
         task["submitted_bytes"] += submitted_bytes
-        diag.emit(
-            "pd_transfer_batch_submitted",
-            **task["identity"],
-            submitted_bytes=submitted_bytes,
-            submitted_segments=segments,
-            result_scope="native_batch",
-        )
         ret = None
         status = "failed"
         error_type = None
+        native_tid = threading.get_native_id()
+        start_wall_ns = time.time_ns()
         start_ns = time.monotonic_ns()
         try:
             ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
@@ -880,11 +932,15 @@ class KVCacheRecvingThread(threading.Thread):
         finally:
             end_time = time.perf_counter()
             end_ns = time.monotonic_ns()
+            end_wall_ns = time.time_ns()
             succeeded_bytes = submitted_bytes if status == "succeeded" else 0
             failed_bytes = submitted_bytes if status in ("failed", "cancelled") else 0
             task["succeeded_bytes"] += succeeded_bytes
             task["failed_bytes"] += failed_bytes
             task["transfer_status"] = status
+            if task["transfer_start_ns"] is None:
+                task["transfer_start_ns"] = start_ns
+            task["transfer_end_ns"] = end_ns
             with self.request_task_counts_lock:
                 summary = self.pd_request_tasks.get(req_meta["request_id"])
                 if summary is not None:
@@ -893,25 +949,46 @@ class KVCacheRecvingThread(threading.Thread):
                     else:
                         summary["transfer_start_ns"] = min(summary["transfer_start_ns"], start_ns)
                     summary["transfer_end_ns"] = max(summary["transfer_end_ns"] or end_ns, end_ns)
-            diag.emit(
-                "pd_transfer_batch_finished",
-                **task["identity"],
-                status=status,
-                error_type=error_type,
-                native_return=ret,
+            task["native_call_count"] += 1
+            task["batch"].add_stage(
+                "wait_for_transfer",
                 start_ns=start_ns,
                 end_ns=end_ns,
-                duration_ns=end_ns - start_ns,
-                transfer_scope_duration_ns=int((end_time - req_start_time) * 1_000_000_000),
-                transfer_scope="original_prepare_and_native_read",
-                submitted_bytes=submitted_bytes,
-                succeeded_bytes=succeeded_bytes,
-                failed_bytes=failed_bytes,
-                submitted_segments=segments,
-                result_scope="native_batch",
-                per_segment_status="unavailable",
-                byte_semantics="submitted_lengths_by_batch_status_not_wire_bytes",
+                status=status,
+                exceptions=int(error_type is not None),
+                completion="native_read_return",
             )
+            if len(task["native_calls"]) < MAX_TRANSFER_NATIVE_CALLS:
+                local = time.localtime(start_wall_ns // 1_000_000_000)
+                offset = getattr(local, "tm_gmtoff", -(time.altzone if local.tm_isdst > 0 else time.timezone))
+                task["native_calls"].append(
+                    {
+                        "call_id": diag.new_id("pd_read"),
+                        "operation": "batch_transfer_sync_read",
+                        "native_tid": native_tid,
+                        "session_id": session_id,
+                        "status": status,
+                        "error_type": error_type,
+                        "native_return": ret,
+                        "start_ns": start_ns,
+                        "end_ns": end_ns,
+                        "duration_ns": end_ns - start_ns,
+                        "start_wall_ns": start_wall_ns,
+                        "end_wall_ns": end_wall_ns,
+                        "wall_utc_offset_seconds": offset,
+                        "transfer_scope_duration_ns": int((end_time - req_start_time) * 1_000_000_000),
+                        "transfer_scope": "original_prepare_and_native_read",
+                        "submitted_bytes": submitted_bytes,
+                        "succeeded_bytes": succeeded_bytes,
+                        "failed_bytes": failed_bytes,
+                        "submitted_segments": segments,
+                        "result_scope": "native_batch",
+                        "per_segment_status": "unavailable",
+                        "byte_semantics": "submitted_lengths_by_batch_status_not_wire_bytes",
+                    }
+                )
+            else:
+                task["native_calls_dropped"] += 1
 
     def _send_done_signal_to_free_remote_port(
         self, request_id: str, remote_host: str, remote_port_send_num: dict[int, RemotePortInfo]
@@ -949,14 +1026,15 @@ class KVCacheRecvingThread(threading.Thread):
 
         num_remote_blocks = sum(len(group_block_ids) for group_block_ids in remote_block_ids)  # noqa: F841
         # Check if we have the remote metadata cached.
-        with diag.span("pd_transfer_meta_fetch", **req_meta["_pd_diag"]["identity"]):
+        with _pd_transfer_stage(req_meta, "meta_fetch"):
             with self.remote_metadata_lock:
                 has_remote_metadata = (
                     remote_engine_id in self.kv_caches_base_addr
                     and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
                 )
             if not has_remote_metadata:
-                self._get_remote_metadata(remote_host, remote_handshake_port)
+                with _pd_transfer_stage(req_meta, "metadata_request"):
+                    self._get_remote_metadata(remote_host, remote_handshake_port)
             with self.remote_metadata_lock:
                 remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
                 local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
@@ -999,7 +1077,7 @@ class KVCacheRecvingThread(threading.Thread):
             )
 
         req_start_time = time.perf_counter()
-        with diag.span("pd_transfer_prepare", **req_meta["_pd_diag"]["identity"]):
+        with _pd_transfer_stage(req_meta, "prepare"):
             src_list, dst_list, length_list = [], [], []
             for i in range(self.hma_group_size):
                 if not remote_block_ids[i] or not local_block_ids[i]:
@@ -1037,7 +1115,6 @@ class KVCacheRecvingThread(threading.Thread):
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
-
     def _transfer_kv_cache(self, req_meta: dict[str, Any]):
         """Handle a KV cache transfer request."""
         remote_block_ids = req_meta["remote_block_ids"][0]
@@ -1061,14 +1138,15 @@ class KVCacheRecvingThread(threading.Thread):
             remote_block_ids = remote_block_ids[-num_local_blocks:]
 
         # Check if we have the remote metadata cached.
-        with diag.span("pd_transfer_meta_fetch", **req_meta["_pd_diag"]["identity"]):
+        with _pd_transfer_stage(req_meta, "meta_fetch"):
             with self.remote_metadata_lock:
                 has_remote_metadata = (
                     remote_engine_id in self.kv_caches_base_addr
                     and remote_handshake_port in self.kv_caches_base_addr[remote_engine_id]
                 )
             if not has_remote_metadata:
-                self._get_remote_metadata(remote_host, remote_handshake_port)
+                with _pd_transfer_stage(req_meta, "metadata_request"):
+                    self._get_remote_metadata(remote_host, remote_handshake_port)
 
         if tp_num_need_pulls == 1:
             grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
@@ -1103,7 +1181,7 @@ class KVCacheRecvingThread(threading.Thread):
         session_id = f"{remote_host}:{remote_transfer_port}"
 
         req_start_time = time.perf_counter()
-        with diag.span("pd_transfer_prepare", **req_meta["_pd_diag"]["identity"]):
+        with _pd_transfer_stage(req_meta, "prepare"):
             src_list, dst_list, length_list = [], [], []
             for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
                 zip(local_kv_caches_base_addrs, remote_kv_caches_base_addrs)
@@ -1127,7 +1205,6 @@ class KVCacheRecvingThread(threading.Thread):
             )
             raise RuntimeError(f"Mooncake transfer failed, ret: {ret}")
 
-
         # Determine if the current position is the offset position at the end of
         # the KV transmission.
         is_kv_transfer_end = global_offset == tp_num_need_pulls * self._prefill_pp_size - 1
@@ -1135,7 +1212,7 @@ class KVCacheRecvingThread(threading.Thread):
         need_nz_cache = get_ascend_config().enable_kv_nz and is_kv_transfer_end
         use_fused_op = get_ascend_config().enable_transpose_kv_cache_by_block
         if need_nz_cache or need_cat_cache:
-            with diag.span("pd_transfer_reformat", **req_meta["_pd_diag"]["identity"]):
+            with _pd_transfer_stage(req_meta, "reformat"):
                 # use fused op to reformat kv cache, we keep original implementation to provide ability to disable it.
                 if use_fused_op and enable_custom_op():
                     if need_cat_cache:
@@ -1737,16 +1814,17 @@ class MooncakeConnectorScheduler:
             )
             req_meta = meta.requests[req_id]
             req_meta.pd_execution_id = scheduler_output.pd_execution_id
-            diag.emit(
-                "pd_request_link",
+            link = diag.Batch(
+                "pd_transfer_summary",
+                scope="link",
                 request_id=req_id,
-                remote_request_id=req_meta.remote_request_id,
-                remote_engine_id=req_meta.remote_engine_id,
-                engine_id=self.engine_id,
                 execution_id=req_meta.pd_execution_id,
+                engine_id=self.engine_id,
                 dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
                 transfer_role="consumer",
             )
+            link.add_link("producer", request_id=req_meta.remote_request_id, engine_id=req_meta.remote_engine_id)
+            link.finish(status="linked", complete=True, incomplete=False)
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
@@ -1790,16 +1868,17 @@ class MooncakeConnectorScheduler:
             self._reqs_need_send[request.request_id] = time.time()
 
         num_prompt_blocks = math.ceil(request.num_prompt_tokens / self.block_size)
-        diag.emit(
-            "pd_transfer_offer",
+        offer = diag.Batch(
+            "pd_transfer_summary",
+            scope="link",
             request_id=request.request_id,
             engine_id=self.engine_id,
-            transfer_request_id=request.request_id,
-            transfer_engine_id=self.engine_id,
             transfer_role="producer",
             dp_rank=self.vllm_config.parallel_config.data_parallel_rank,
             delayed_free=delay_free_blocks,
         )
+        offer.add_link("producer", request_id=request.request_id, engine_id=self.engine_id)
+        offer.finish(status="offered", complete=True, incomplete=False)
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,

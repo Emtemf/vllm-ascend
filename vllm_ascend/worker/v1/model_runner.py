@@ -73,8 +73,6 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
-from vllm.v1.metrics import pd_diagnostics as diag
-from vllm.v1.worker.worker_base import pd_execution, pd_sample
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     CircularBufferSpec,
@@ -87,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -120,6 +119,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     raise_if_nan_logits,
 )
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -2015,7 +2015,6 @@ class NPUModelRunner(GPUModelRunner):
             self.valid_sampled_token_count_gpu = valid_sampled_tokens_count # type: ignore[no-redef]
         self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
 
-    @diag.span("runner.draft", completion="host_return")
     def propose_draft_token_ids(
         self,
         valid_sampled_token_ids: torch.Tensor | list[list[int]],
@@ -2406,7 +2405,7 @@ class NPUModelRunner(GPUModelRunner):
             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
-        with record_function_or_nullcontext("prepare input"), diag.span("runner.input_prepare"):
+        with record_function_or_nullcontext("prepare input"):
             with self.synchronize_input_prep():
                 # Fix up prev_req_id_to_index for requests that were discarded
                 # in the previous sample_tokens step. If a request has
@@ -2754,8 +2753,7 @@ class NPUModelRunner(GPUModelRunner):
                     return output
 
                 sample_hidden_states = hidden_states[logits_indices]
-                with diag.span("runner.logits", completion="host_return"):
-                    logits = self.model.compute_logits(sample_hidden_states)
+                logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -2766,8 +2764,7 @@ class NPUModelRunner(GPUModelRunner):
                     logits = None
                 else:
                     sample_hidden_states = hidden_states[logits_indices]
-                    with diag.span("runner.logits", completion="host_return"):
-                        logits = self.model.compute_logits(sample_hidden_states)
+                    logits = self.model.compute_logits(sample_hidden_states)
 
                 model_output_broadcast_data: dict[str, Any] = {}
                 if logits is not None:
@@ -2993,24 +2990,23 @@ class NPUModelRunner(GPUModelRunner):
                 with record_function_or_nullcontext("draft_token"):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
-        with diag.span("runner.postprocess"):
-            (
-                num_nans_in_logits,
-                num_nans_device,
-                logprobs_lists,
-                valid_sampled_token_ids,
-                prompt_logprobs_dict,
-                req_ids_output_copy,
-                req_id_to_index_output_copy,
-                invalid_req_indices,
-            ) = self._bookkeeping_sync(
-                scheduler_output,
-                sampler_output,
-                logits,
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
-                spec_decode_metadata,
-            )
+        (
+            num_nans_in_logits,
+            num_nans_device,
+            logprobs_lists,
+            valid_sampled_token_ids,
+            prompt_logprobs_dict,
+            req_ids_output_copy,
+            req_id_to_index_output_copy,
+            invalid_req_indices,
+        ) = self._bookkeeping_sync(
+            scheduler_output,
+            sampler_output,
+            logits,
+            hidden_states,
+            scheduler_output.total_num_scheduled_tokens,
+            spec_decode_metadata,
+        )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:

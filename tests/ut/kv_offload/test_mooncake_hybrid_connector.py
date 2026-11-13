@@ -1,3 +1,4 @@
+import json
 import queue
 import sys
 import threading
@@ -16,6 +17,7 @@ fake_engine.TransferEngine = MagicMock()  # type: ignore[attr-defined]
 sys.modules["mooncake.engine"] = fake_engine
 
 from vllm.v1.kv_cache_interface import MambaSpec  # noqa: E402
+from vllm.v1.metrics import pd_diagnostics as diag  # noqa: E402
 from vllm.v1.request import RequestStatus  # noqa: E402
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector import (  # noqa: E402
@@ -61,6 +63,9 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         thread.request_task_counts = defaultdict(int)
         thread.finished_request_markers = set()
         thread.request_task_counts_lock = threading.Lock()
+        thread.pd_connector_id = "connector"
+        thread.pd_request_tasks = {}
+        thread.vllm_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(data_parallel_rank=0))
         return thread
 
     def test_request_summary_retains_completion_when_done_acks_finish_in_reverse(self):
@@ -70,9 +75,7 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
         thread.tp_rank = 0
         thread.local_engine_id = "decode"
         thread.pd_connector_id = "connector"
-        thread.vllm_config = types.SimpleNamespace(
-            parallel_config=types.SimpleNamespace(data_parallel_rank=0)
-        )
+        thread.vllm_config = types.SimpleNamespace(parallel_config=types.SimpleNamespace(data_parallel_rank=0))
         thread.pd_request_tasks = {}
         thread.request_queue = queue.Queue()
         thread.task_tracker = KVCacheTaskTracker()
@@ -108,11 +111,7 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
             thread._mark_request_task_submitted(task)
             tasks.append(task)
 
-        records = []
-        with patch(
-            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector.diag.emit",
-            side_effect=lambda event, **fields: records.append({"event": event, **fields}),
-        ):
+        with self.assertLogs(diag._LOG, level="INFO") as captured:
             first = thread.executor.submit(thread._handle_request, tasks[0])
             try:
                 self.assertTrue(first_waiting_for_ack.wait(timeout=5))
@@ -126,17 +125,27 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
                 self.assertFalse(thread.finished_request_markers)
                 self.assertFalse(thread.proc_not_transfer_request)
                 self.assertEqual(thread.request_queue.unfinished_tasks, 0)
-                self.assertFalse(any(r["event"] == "pd_transfer_request_finished" for r in records))
+                records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+                self.assertFalse(any(r.get("scope") == "request_generation" for r in records))
             finally:
                 release_first_ack.set()
                 first.result(timeout=5)
-        finished = [r for r in records if r["event"] == "pd_transfer_task_finished"]
+        records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(r["event"] == "pd_transfer_summary" and r["version"] == 2 for r in records))
+        finished = [r for r in records if r["scope"] == "task"]
         self.assertEqual([r["tracker_completed"] for r in finished], [True, False])
-        summaries = [r for r in records if r["event"] == "pd_transfer_request_finished"]
+        summaries = [r for r in records if r["scope"] == "request_generation"]
         self.assertEqual(len(summaries), 1)
         self.assertTrue(summaries[0]["tracker_completed"])
         self.assertEqual(summaries[0]["submitted_tasks"], 2)
         self.assertEqual(summaries[0]["succeeded_tasks"], 2)
+        self.assertEqual({r["request_generation"] for r in finished}, {summaries[0]["request_generation"]})
+        self.assertEqual({r["remote_request_id"] for r in finished}, {"prefill-a", "prefill-b"})
+        self.assertIsNone(summaries[0]["remote_request_id"])
+        self.assertIsNone(summaries[0]["execution_id"])
+        self.assertTrue(all(r["stages"]["wait_for_transfer"]["calls"] == 0 for r in finished))
+        self.assertTrue(all(r["links"][0]["kind"] == "producer" for r in finished))
         self.assertFalse(thread.pd_request_tasks)
         self.assertEqual(thread._transfer_kv_cache.call_count, 2)
         self.assertEqual(thread._send_done_signal_to_free_remote_port.call_count, 2)
@@ -190,11 +199,38 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
                 )
                 req_meta = thread.request_queue.get_nowait()
                 thread._mark_request_task_submitted(req_meta)
-                with patch(
-                    "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector.logger.exception"
-                ) as log_exception:
+                with (
+                    self.assertLogs(diag._LOG, level="INFO") as captured,
+                    patch(
+                        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_hybrid_connector.logger.exception"
+                    ) as log_exception,
+                ):
                     thread._handle_request(req_meta)
                 self.assertEqual(log_exception.call_count, int(outcome == "failure"))
+                records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+                task, summary = records
+                self.assertEqual([r["scope"] for r in records], ["task", "request_generation"])
+                self.assertTrue(all(r["version"] == 2 and r["event"] == "pd_transfer_summary" for r in records))
+                self.assertEqual(task["request_generation"], summary["request_generation"])
+                self.assertEqual(
+                    task["status"], {"success": "succeeded", "empty": "skipped", "failure": "failed"}[outcome]
+                )
+                self.assertEqual(task["stages"]["submit"]["status"], "skipped")
+                self.assertEqual(task["stages"]["submit"]["calls"], 0)
+                self.assertEqual(task["stages"]["wait_for_transfer"]["calls"], int(outcome != "empty"))
+                if outcome == "empty":
+                    self.assertIsNone(task["transfer_envelope_ns"])
+                    self.assertEqual(task["native_calls"], [])
+                else:
+                    native = task["native_calls"][0]
+                    self.assertEqual(task["stages"]["wait_for_transfer"]["duration_ns"], native["duration_ns"])
+                    self.assertEqual(task["transfer_envelope_ns"], native["duration_ns"])
+                    self.assertEqual(native["submitted_bytes"], 80)
+                    self.assertEqual(native["submitted_segments"], 3)
+                    self.assertIsInstance(native["native_tid"], int)
+                    self.assertIsInstance(native["wall_utc_offset_seconds"], int)
+                    self.assertLessEqual(native["start_wall_ns"], native["end_wall_ns"])
+                    self.assertTrue(native["call_id"])
                 if outcome == "empty":
                     thread.engine.batch_transfer_sync_read.assert_not_called()
                 else:
@@ -291,6 +327,7 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
                             "remote_host": f"host-{index}",
                             "remote_handshake_port": 6000 + index,
                             "all_task_done": True,
+                            "_pd_diag": {},
                         }
                     )
                 self.assertTrue(both_workers_started.wait(timeout=5.0), "executor did not start two workers")
@@ -337,18 +374,21 @@ class TestHybridKVCacheRecvingThreadDispatch(unittest.TestCase):
             "remote_host": "host-a",
             "remote_handshake_port": 6000,
             "all_task_done": False,
+            "_pd_diag": {},
         }
         same_peer_2 = {
             "request_id": "same-peer-2",
             "remote_host": "host-a",
             "remote_handshake_port": 6000,
             "all_task_done": True,
+            "_pd_diag": {},
         }
         other_peer = {
             "request_id": "other-peer-1",
             "remote_host": "host-b",
             "remote_handshake_port": 6001,
             "all_task_done": True,
+            "_pd_diag": {},
         }
 
         try:
