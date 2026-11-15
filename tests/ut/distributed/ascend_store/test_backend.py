@@ -25,6 +25,7 @@ from typing import Any
 from unittest.mock import MagicMock, call, patch
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
     get_backend_class,
@@ -64,6 +65,177 @@ from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend.yuanrong_b
 def _format_log_call(call):
     args = call.args
     return args[0] % args[1:]
+
+
+class TestPoolDiagnosticResults(unittest.TestCase):
+    def test_extra_results_do_not_count_as_submitted_key_outcomes(self):
+        for mode, success, failure in (("boolean", True, False), ("zero", 0, -1), ("nonnegative", 8, -1)):
+            for first, extra, succeeded in ((success, failure, 1), (failure, success, 0)):
+                with self.subTest(mode=mode, first=first):
+                    with (
+                        pool_diag.processing(pool_diag.capture(None, "test", queued=False)) as task,
+                        pool_diag.backend("test", 1, [[8]], mode) as call,
+                    ):
+                        call.result([first, extra])
+                    counters = task.counters
+                    self.assertEqual(counters["test_submitted_keys"], 1)
+                    self.assertEqual(counters["test_succeeded_keys"], succeeded)
+                    self.assertEqual(counters["test_failed_keys"], 1 - succeeded)
+                    self.assertEqual(counters["test_succeeded_bytes"], 8 * succeeded)
+                    self.assertEqual(counters["test_failed_bytes"], 8 * (1 - succeeded))
+                    self.assertEqual(counters["test_result_count"], 2)
+                    self.assertEqual(counters["test_extra_results"], 1)
+                    self.assertEqual(counters["test_unreported_keys"], 0)
+
+    def test_missing_and_unknown_results_remain_distinct(self):
+        for values, unreported, unknown in (([0], 1, 0), (None, 0, 2)):
+            with self.subTest(values=values):
+                with (
+                    pool_diag.processing(pool_diag.capture(None, "test", queued=False)) as task,
+                    pool_diag.backend("test", 2, [[8], [16]]) as call,
+                ):
+                    call.result(values)
+                self.assertEqual(task.counters["test_unreported_keys"], unreported)
+                self.assertEqual(task.counters["test_unknown_result_keys"], unknown)
+                self.assertEqual(task.status, "unknown_result")
+
+    def test_backend_wrapper_preserves_return_and_exception_identity(self):
+        result = [True, False]
+        store = SimpleNamespace(put=MagicMock(return_value=result))
+        self.assertIs(pool_diag.put(store, ["k"], [[100]], [[8]]), result)
+        failure = RuntimeError("backend sentinel")
+        store.put.side_effect = failure
+        with self.assertRaises(RuntimeError) as raised:
+            pool_diag.put(store, ["k"], [[100]], [[8]])
+        self.assertIs(raised.exception, failure)
+
+    def test_native_boundary_survives_failed_put_without_changing_exception(self):
+        failure = RuntimeError("native put sentinel")
+        request = SimpleNamespace(req_id="A", pd_execution_id="E")
+        snapshot = pool_diag.capture(request, "save", 2, queued=False)
+        with (
+            self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured,
+            self.assertRaises(RuntimeError) as raised,
+            pool_diag.processing(snapshot),
+            pool_diag.backend("mooncake_put", 1, [[8]], "nonnegative"),
+        ):
+            raise failure
+        self.assertIs(raised.exception, failure)
+        records = [json.loads(record.getMessage().split("[PD_DIAG] ", 1)[1]) for record in captured.records]
+        self.assertEqual(len(records), 1)
+        task = records[0]
+        self.assertEqual(task["version"], 2)
+        self.assertEqual(task["event"], "pool_task")
+        self.assertEqual(task["request_id"], "A")
+        self.assertEqual(task["members"], [{"request_id": "A", "execution_id": "E"}])
+        self.assertEqual(len(task["native_calls"]), 1)
+        native = task["native_calls"][0]
+        self.assertTrue(native["call_id"])
+        self.assertIsInstance(native["native_tid"], int)
+        self.assertLessEqual(native["start_wall_ns"], native["end_wall_ns"])
+        self.assertEqual(native["status"], "exception")
+        self.assertEqual(task["status"], "exception")
+
+    def test_details_are_bounded_and_member_job_sentinel_is_not_an_identity(self):
+        requests = [SimpleNamespace(req_id=f"R{i}", pd_execution_id="E", store_job_id=-1) for i in range(4)]
+        with (
+            patch.object(pool_diag, "MAX_MEMBERS", 2),
+            patch.object(pool_diag, "MAX_NATIVE_CALLS", 2),
+            patch.object(pool_diag, "MAX_COMPLETIONS", 2),
+            self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured,
+        ):
+            snapshot = pool_diag.capture(requests, "save", queued=False)
+            with pool_diag.processing(snapshot) as task:
+                for _ in range(3):
+                    with pool_diag.backend("mooncake_put", 1, [[8]], "nonnegative") as call:
+                        call.result([8])
+                    pool_diag.completion(request_id="R0", store_job_id=-1, remaining_jobs=0)
+                task.finish()
+        records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+        self.assertEqual(len(records), 1)
+        summary = records[0]
+        self.assertEqual(summary["event"], "pool_task")
+        self.assertEqual(summary["version"], 2)
+        self.assertEqual(len(summary["members"]), 2)
+        self.assertTrue(all("store_job_id" not in member for member in summary["members"]))
+        self.assertEqual(summary["members_dropped"], 2)
+        self.assertEqual(summary["native_call_count"], 3)
+        self.assertEqual(len(summary["native_calls"]), 2)
+        self.assertEqual(summary["native_calls_dropped"], 1)
+        self.assertEqual(summary["completions_dropped"], 1)
+        self.assertEqual(summary["completions"][0]["completion_semantics"], "bookkeeping_only")
+        self.assertNotIn("store_job_id", summary["completions"][0])
+        self.assertTrue(summary["incomplete"])
+        self.assertFalse(summary["complete"])
+
+    def test_frozen_members_and_zero_repeated_generator_calls(self):
+        request = SimpleNamespace(
+            req_id="A",
+            pd_execution_id="submit",
+            store_job_id=7,
+            pd_observation_id="observation",
+            request_generation="generation",
+        )
+        snapshot = pool_diag.capture(request, "save", queued=False)
+        request.pd_execution_id = "later"
+        request.store_job_id = 8
+
+        @pool_diag.timed_iterator("build_key")
+        def keys():
+            yield "one"
+            yield "two"
+
+        with (
+            self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured,
+            patch.object(pool_diag.time, "monotonic_ns", return_value=100),
+            pool_diag.diag.scope(execution_id="unrelated"),
+            pool_diag.processing(snapshot),
+        ):
+            self.assertEqual(list(keys()), ["one", "two"])
+        summary = json.loads(captured.records[0].getMessage().split("[PD_DIAG] ", 1)[1])
+        self.assertEqual(summary["execution_id"], "submit")
+        self.assertEqual(
+            summary["members"],
+            [
+                {
+                    "request_id": "A",
+                    "execution_id": "submit",
+                    "observation_id": "observation",
+                    "request_generation": "generation",
+                    "store_job_id": 7,
+                }
+            ],
+        )
+        self.assertEqual(set(summary["stages"]), {"build_key", "lookup", "prepare", "sync", "put"})
+        self.assertIn("processing", summary["associated_stages"])
+        self.assertEqual(summary["stages"]["build_key"]["calls"], 3)
+        self.assertEqual(summary["stages"]["build_key"]["duration_ns"], 0)
+        self.assertEqual(summary["stages"]["build_key"]["status"], "ok")
+        self.assertEqual(summary["stages"]["put"]["status"], "unmeasured")
+        self.assertNotIn("duration_ns", summary["stages"]["put"])
+
+    def test_layer_members_merge_and_exception_is_observed_once(self):
+        first = pool_diag.capture(SimpleNamespace(req_id="A", pd_execution_id="E"), "save", queued=False)
+        second = pool_diag.capture(SimpleNamespace(req_id="B", pd_execution_id="E"), "save", queued=False)
+        failure = RuntimeError("prepare sentinel")
+        with self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured:
+            with pool_diag.processing(first, final=False) as task, pool_diag.stage("prepare"):
+                pass
+            with (
+                self.assertRaises(RuntimeError) as raised,
+                pool_diag.processing(second, task, final=False),
+                pool_diag.stage("prepare"),
+            ):
+                raise failure
+            task.finish()
+        records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["request_id"], None)
+        self.assertEqual({member["request_id"] for member in records[0]["members"]}, {"A", "B"})
+        self.assertEqual(records[0]["stages"]["prepare"]["calls"], 2)
+        self.assertEqual(records[0]["stages"]["prepare"]["exceptions"], 1)
+        self.assertEqual(records[0]["stages"]["prepare"]["status"], "exception")
 
 
 # =========================================================================
@@ -490,6 +662,31 @@ class TestMooncakeBackendSetup(unittest.TestCase):
         ):
             mock_global_te.get_transfer_engine.return_value = transfer_engine
             return backend._setup_store()
+
+    def test_preferred_segment_uses_registered_name_after_auto_port_setup(self):
+        """Placement must target the mounted segment, not the bare setup IP."""
+        for mode in ("shared", "independent", "fabric", "config_dict"):
+            with self.subTest(mode=mode):
+                config = _make_mooncake_store_config(preferred_segment=True)
+                backend = self._make_backend(
+                    config=config, use_fabric_mem=mode == "fabric"
+                )
+                backend._use_store_independent_te = mode == "independent"
+                store = MagicMock()
+                store.setup.return_value = 0
+                store.get_hostname.return_value = "10.0.0.7:14110"
+                prefetch = SimpleNamespace(
+                    use_dict_setup=mode == "config_dict",
+                    enabled=False,
+                    knobs={},
+                )
+                with (
+                    patch(f"{self._MODULE_PATH}._resolve_ssd_prefetch", return_value=prefetch),
+                    patch(f"{self._MODULE_PATH}.ReplicateConfig", SimpleNamespace),
+                ):
+                    self._setup_store(backend, store)
+                    placement = backend._build_replicate_config()
+                self.assertEqual(placement.preferred_segment, "10.0.0.7:14110")
 
     def test_dp_clients_use_distinct_ssd_paths_and_log_actual_directories(self):
         for use_fabric_mem, use_store_independent_te in ((False, False), (True, False), (False, True)):
@@ -945,6 +1142,41 @@ class TestMooncakeBackendMethods(unittest.TestCase):
         b.store.batch_get_session_start.return_value = []
         with self.assertRaisesRegex(RuntimeError, "returned 0 results for 1 keys"):
             b.batch_get_start(["k"])
+
+    def test_layerwise_iterable_results_are_classified_after_single_normalization(self):
+        cases = (
+            ("batch_put_start", "batch_put_session_start", (["k"], [8]), 0),
+            ("batch_copy_put", "batch_put_from_multi_buffer_ranges", (["k"], [[100]], [[8]], [[0]]), 8),
+            ("batch_copy_get", "batch_get_into_multi_buffer_ranges", (["k"], [[100]], [[8]], [[0]]), 8),
+        )
+        for operation, native_operation, arguments, success in cases:
+            for value in (success, -1):
+                with self.subTest(operation=operation, value=value):
+                    backend = self._make_backend()
+                    consumed = []
+
+                    def results(consumed=consumed, value=value):
+                        consumed.append(value)
+                        yield value
+
+                    getattr(backend.store, native_operation).return_value = results()
+                    with pool_diag.processing(pool_diag.capture(None, operation, queued=False)) as task:
+                        result = getattr(backend, operation)(*arguments)
+                    self.assertEqual(result, [value])
+                    self.assertEqual(consumed, [value])
+                    self.assertEqual(task.counters[native_operation + "_succeeded_keys"], int(value >= 0))
+                    self.assertEqual(task.counters[native_operation + "_failed_keys"], int(value < 0))
+                    self.assertEqual(task.counters[native_operation + "_unknown_result_keys"], 0)
+                    self.assertEqual(task.counters[native_operation + "_succeeded_bytes"], 8 * int(value >= 0))
+                    self.assertEqual(task.counters[native_operation + "_failed_bytes"], 8 * int(value < 0))
+
+    def test_layerwise_normalization_preserves_backend_errors(self):
+        backend = self._make_backend()
+        failure = RuntimeError("native sentinel")
+        backend.store.batch_get_session_start.side_effect = failure
+        with self.assertRaises(RuntimeError) as raised:
+            backend.batch_get_start(["k"])
+        self.assertIs(raised.exception, failure)
 
     def test_register_buffer_with_store_independent_te(self):
         b = self._make_backend()

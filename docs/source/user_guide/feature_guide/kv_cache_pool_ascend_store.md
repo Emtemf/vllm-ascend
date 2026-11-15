@@ -62,6 +62,93 @@ For non-layerwise complete-block transfers, adjacent MLA components sharing one 
 
 This bulk fast path uses physical-page-major object contents instead of the previous component-major segmented contents. A fresh namespace is required even when upgrading from the earlier segmented version of this fix. Writers and readers must agree on transfer mode and cache layout; do not share these objects with layerwise readers or workers using a different component layout.
 
+`preferred_segment: true` uses the segment name returned by Mooncake after
+initialization, including its automatically assigned port. This applies to shared
+and independent TransferEngine setup paths. It is an allocation preference, not
+a restriction: other segments can still be selected if the preferred segment is
+unavailable, so their transport must also support the registered memory type.
+
+## Per-request Pool diagnostics
+
+The paired vLLM/Ascend diagnostic implementation emits `[PD_DIAG]` JSON through
+`vllm.v1.metrics.pd_diagnostics`. It does not enable the model profiler, add device
+synchronization, retry transfers, or change backend results and completion fences.
+
+Diagnostic wrappers preserve the original methods' positional and keyword calling
+conventions, return objects, and exceptions. Argument observation does not rebind
+or validate business calls.
+
+This diagnostic tree is based on Ascend `v0.32.0rc1`
+(`24487f4f48ee99cf45d86d1c504e645549b8c1ef`) and pairs with the existing
+vLLM `v0.32.0` diagnostic implementation. It carries the Pool/P-D observations
+and the registered-name `preferred_segment` correction; it does not include
+later upstream changes such as #21557. Deploy the RC1 package as a whole before
+applying diagnostic overlays, and restart both writers and readers together.
+
+* `pool_task` is a bounded summary for an existing save/load job or a preparation/
+  submission operation. It carries `task_id`, `operation`, `request_id` (or
+  `request_ids` for shared work), `execution_id`, the existing `store_job_id` when
+  present, and the proved worker `tp_rank` plus available contextual ranks.
+  `pool_task_member` explicitly links members of a shared task. Shared work must
+  not be charged exclusively to every member or summed across parallel TP workers.
+* Scheduler `pd_execution_id` is copied to connector metadata and request metadata
+  without overwriting an already-bound origin. Queue entry captures immutable
+  identities, restored in the processing thread. Layerwise views retain their
+  request's origin, including deferred/MTP saves. Missing identities remain unknown.
+* `start_ns`, `end_ns`, and `duration_ns` use the host monotonic clock.
+  `queue_enter_ns` is present only for a measured queue entry; synchronous work has
+  a null queue timestamp, not a measured zero wait. `counters.queue_wait_ns` sums
+  actual queue-entry waits for the task. Cross-host clocks are not interchangeable.
+* `stages` contains bounded aggregates for real `build_key`, `lookup`, `prepare`,
+  existing `sync`/`wait`, queue submission, and backend calls. Each stage contains
+  `calls`, `start_ns`, `end_ns`, summed `duration_ns`, and `exceptions`.
+  With multiple calls, the start/end pair is an envelope, not a contiguous native
+  call. Stages can overlap; neither stage sums nor host elapsed are NPU compute time.
+* `counters` retain candidate/missing/retained keys, lookup hits/failures/skips,
+  all-hit groups, and submitted/result/succeeded/failed/unknown keys and bytes.
+  `put_*`/`get_*` describe the connector contract; `mooncake_put_*`/
+  `mooncake_get_*` describe the actual native submission. These are two views of
+  the same work and must not be added together. Result-shape mismatches retain
+  unreported/extra counts. An exception or missing result is not a measured
+  zero-byte success. Batch-only results do not invent per-key outcomes.
+  Only results corresponding to submitted keys contribute successful/failed key
+  counts; extra entries cannot create additional successful keys.
+* The actual Mooncake session/range APIs are measured separately:
+  `batch_put_session_start`, `batch_put_from_multi_buffer_ranges`,
+  `batch_put_session_end`, `batch_put_session_revoke`, and their get counterparts.
+  Object reservation sizes are not copied payload bytes. Copy results use the
+  actual nonnegative-success contract; session/commit/revoke use zero-success.
+  Valid iterable results are normalized once before classification. Layerwise
+  entries aggregate through the last actual queue-ordered transfer, including
+  layouts with an empty final layer. Shared GVA/key preparation is observed at
+  the precompute call itself, rather than charged again to each layer.
+  Interrupted/incomplete aggregates carry `incomplete=true`.
+* Status distinguishes `no_task`, `all_hit`, `succeeded`, `backend_failure`,
+  `unknown_result`, `failed`, `exception`, `skipped`, and missing load metadata.
+  `submission_returned` means only that submission returned, not that KV was saved.
+  `pool_store_completion` and `pool_events_completed` explicitly use
+  `completion_semantics="bookkeeping_only"`: only backend results establish success.
+  Any paired vLLM `pool_save_fence` observation must describe the connector's
+  actual fence. `save_wait` tasks retain the original execution when the final
+  layer's wait is deferred; `wait_returned` is not backend success.
+* In the ordinary RC1 path, `wait_for_save` submits a batch without a per-call
+  queue join. The unchanged `wait_for_previous_save()` waits for that entire
+  previous batch, including its existing failure polling, before the next
+  execution. It is not the released-request-only fence used by the older
+  diagnostic tree. Backend put and task completion are separate boundaries.
+  Layerwise saves still drain at the final layer by default; do not infer
+  ordinary-path behavior from the layerwise connector interface.
+
+Records contain counts and identities, never prompts, raw cache keys, or addresses.
+For whole-key Mooncake put calls, `pool_native_call` adds wall-clock start/end,
+the source UTC offset, submitted counts, and the existing task/thread identity.
+It does not alter call arguments, return objects, exceptions or completion logic.
+The paired report uses these boundaries plus glog native TID/timestamps to
+associate phases with a unique task, reconciling native counts when present.
+Timestamp precision, reused TIDs, overlapping calls, and separate unidentified
+log sources cannot silently select a task. Without boundary evidence, native
+records remain pending. Bounded stage aggregates are not individual call bounds.
+
 ## Scenario 1: Mooncake Backend
 
 ### Configuration Examples
@@ -1641,6 +1728,42 @@ QoS can be configured through `kv_connector_extra_config`, which is injected int
 | `qos_priority` | int | 0 | No | [0, 4] (integer, larger = higher priority) | Supported by both Mooncake and Memcache backends. Invalid values (non-integer, out of range) cause fast startup failure. |
 
 Values in `kv_connector_extra_config` take precedence over environment variables; a WARN log is emitted on override. For the Mooncake backend, `qos_priority` is merged into existing `ASCEND_GLOBAL_RESOURCE_CONFIG` (other fields preserved). When `ASCEND_GLOBAL_RESOURCE_CONFIG` was not set, configuring `qos_priority` also creates it.
+
+## Compact TTFT diagnostics (schema 2)
+
+The isolated compact TTFT integration emits `[PD_DIAG]` JSON with `version: 2`.
+It requires matching vLLM diagnostic helpers and the schema-2 reader; it does
+not emit or reconstruct schema-1 leaf records. Official request statistics and
+the existing transfer, synchronization and completion order are unchanged.
+
+`pool_task` describes the existing submission, background save/load, shared
+preparation, or final layerwise `save_wait` scope. Only `build_key`, `lookup`,
+`prepare`, `sync`, and `put` are display stages. Queue waits, backend calls,
+processing envelopes and final save fences remain associated evidence rather
+than additional display stages. Repeated durations sum actual invocations,
+including real zero; skipped or unmeasured stages have no measured duration.
+Members freeze request/execution and available observation/generation/job
+identity at submission. Each task retains at most 128 members, 64 native calls
+and 128 bookkeeping completions. Dropped detail is counted and marks the record
+incomplete; bookkeeping completion does not establish backend success.
+
+Mooncake hybrid receive diagnostics use separate `pd_transfer_summary` records
+for each task, request-generation closure and explicit producer/consumer link.
+`submit` measures actual remote metadata requests (cached metadata is skipped),
+and `wait_for_transfer` sums actual synchronous native READ calls.
+`transfer_envelope_ns` is separate, includes gaps between READ calls, and is
+neither a task sum nor pure waiting time. Native samples preserve the calling
+native thread ID, monotonic and wall-clock windows, UTC offset and call ID.
+Cross-process matching needs explicit process/run provenance or the same log
+source, thread identity and an unambiguous wall-clock window; monotonic clocks
+must not be compared across processes or runs. Submitted byte counts describe
+requested lengths, not measured wire traffic or per-segment completion.
+
+CPU diagnostic fixtures do not validate NPU serving, native cross-process
+transfer correctness, model output, production Decode behavior or performance.
+Those remain unverified for this compact integration until exercised on the
+matched deployment revisions and runtime. No extra device synchronization,
+request wait or service lifecycle change is introduced by diagnostics.
 
 ## FAQ
 

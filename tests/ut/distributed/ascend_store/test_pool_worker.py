@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import json
 import queue
 import threading
 import unittest
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalcu
 from vllm.v1.core.kv_cache_utils import maybe_convert_block_hash
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheGroupSpec, MambaSpec, UniformTypeKVCacheSpecs
 
+from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store import diagnostics as pool_diag
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
     AscendStoreConnector,
     create_kv_pool_worker,
@@ -751,6 +753,31 @@ class TestKVPoolWorkerHelpers(unittest.TestCase):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import KVPoolWorker
 
         return KVPoolWorker
+
+    def test_diagnostic_task_preserves_original_exception_identity(self):
+        failure = RuntimeError("save eligibility sentinel")
+
+        class FailingRequest:
+            req_id = "request"
+
+            @property
+            def can_save(self):
+                raise failure
+
+        cls = self._make_worker_class()
+        worker = cls.__new__(cls)
+        worker.tp_rank = 0
+        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+        metadata = AscendConnectorMetadata(set())
+        metadata.requests = [FailingRequest()]
+        method = cls.wait_for_save
+        calls = (((worker, metadata), {}), ((worker,), {"connector_metadata": metadata}))
+        for function in (method.__wrapped__, method):
+            for args, kwargs in calls:
+                with self.subTest(wrapped=function is method, kwargs=tuple(kwargs)):
+                    with self.assertRaises(RuntimeError) as raised:
+                        function(*args, **kwargs)
+                    self.assertIs(raised.exception, failure)
 
     def test_global_group_alloc_size_rounds_up(self):
         cls = self._make_worker_class()
@@ -1526,28 +1553,35 @@ class TestKVPoolWorkerRegisterAndTransfer(unittest.TestCase):
         self.assertEqual(worker.get_block_ids_with_load_errors(), {7})
 
     def test_wait_for_save_submits_batch_without_joining_queue(self):
-        worker = self._make_worker()
-        worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
-        worker.kv_send_thread.request_queue = MagicMock()
-        save_batch = MagicMock()
-        worker.kv_send_thread.add_save_batch.return_value = save_batch
-
-        req = ReqMeta(
-            req_id="r1",
-            token_len_chunk=16,
-            block_ids=[0],
-            block_hashes=["h0"],
-            can_save=True,
-        )
-        meta = AscendConnectorMetadata(set(), set())
-        meta.add_request(req)
-        module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
-        with patch(f"{module}.torch.npu", create=True):
-            worker.wait_for_save(meta)
-        worker.kv_send_thread.raise_if_failed.assert_not_called()
-        worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
-        worker.kv_send_thread.request_queue.join.assert_not_called()
-        self.assertIs(worker._previous_save_batch, save_batch)
+        for use_keyword in (False, True):
+            with self.subTest(use_keyword=use_keyword):
+                worker = self._make_worker()
+                worker.kv_send_thread = MagicMock(spec=KVCacheStoreSendingThread)
+                worker.kv_send_thread.request_queue = MagicMock()
+                save_batch = object()
+                worker.kv_send_thread.add_save_batch.return_value = save_batch
+                req = ReqMeta(
+                    req_id="r1",
+                    token_len_chunk=16,
+                    block_ids=[0],
+                    block_hashes=["h0"],
+                    can_save=True,
+                )
+                meta = AscendConnectorMetadata(set(), set())
+                meta.add_request(req)
+                module = "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker"
+                with patch(f"{module}.torch.npu", create=True) as npu:
+                    if use_keyword:
+                        worker.wait_for_save(connector_metadata=meta)
+                    else:
+                        worker.wait_for_save(meta)
+                worker.kv_send_thread.raise_if_failed.assert_not_called()
+                worker.kv_send_thread.add_save_batch.assert_called_once_with([req])
+                worker.kv_send_thread.request_queue.join.assert_not_called()
+                self.assertIs(worker._previous_save_batch, save_batch)
+                self.assertIs(req.current_event, npu.Event.return_value)
+                self.assertIs(req.skip_null_blocks_by_group, worker.group_uses_align_state)
+                npu.Event.return_value.record.assert_called_once_with()
 
     def test_wait_for_save_skip_non_save(self):
         worker = self._make_worker()
@@ -2138,6 +2172,102 @@ class TestKVPoolWorkerProcessLayerData(unittest.TestCase):
             old_load_tasks[layer_id].clear()
             self.assertEqual(worker.layer_save_tasks[layer_id], [save_marker])
             self.assertEqual(worker.layer_load_tasks[layer_id], [load_marker])
+
+    def test_shared_preparation_records_actual_gva_and_key_work(self):
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import (
+            KVCacheStoreKeyLayerSendingThread,
+            KVCacheStoreLayerRecvingThread,
+            KVCacheStoreLayerSendingThread,
+        )
+
+        for path, reuse in (("gva", False), ("gva", True), ("key", False)):
+            with self.subTest(path=path, reuse=reuse):
+                worker = self._make_worker()
+                worker.num_layers = 3
+                worker.num_kv_cache_groups = 1
+                worker.use_block_key_layerwise = False
+                worker.layerwise_offload = reuse
+                worker.prefetch_layer_map = {}
+                request = ReqMeta(
+                    "prepare-r",
+                    token_len_chunk=16,
+                    block_ids=[7],
+                    block_hashes=[b"h0"],
+                    block_ids_np=np.asarray([7]),
+                    block_gvas_np=np.asarray([100]),
+                    load_block_gvas_np=np.asarray([200]),
+                    can_save=True,
+                    is_last_chunk=True,
+                    pd_execution_id="prepare-execution",
+                )
+                database = SimpleNamespace(
+                    group_block_len={0: [8, 8, 8]},
+                    group_kv_caches_base_addr={0: [1000, 2000, 3000]},
+                    group_block_stride={},
+                    group_layer_cache_entry_offsets={},
+                )
+                builder = LayerBatchBuilder(database, page_size_bytes=24, num_layers=3)
+                if path == "gva":
+                    sender = object.__new__(KVCacheStoreLayerSendingThread)
+                    sender.group_builders = [builder]
+                else:
+                    sender = object.__new__(KVCacheStoreKeyLayerSendingThread)
+                    sender.block_size = 16
+                    sender.final_layer_id = 2
+                    sender.layer_offset = 0
+                    key = SimpleNamespace(split_layers=lambda count, offset: ["layer-0", "layer-1", "layer-2"])
+                    sender.token_database = SimpleNamespace(process_tokens=lambda *args, key=key: iter([(0, 16, key)]))
+                receiver = object.__new__(KVCacheStoreLayerRecvingThread)
+                receiver.group_builders = [LayerBatchBuilder(database, page_size_bytes=24, num_layers=3)]
+                worker.kv_send_thread = sender
+                worker.kv_recv_thread = receiver
+                worker._groups_for_layerwise_transfer = lambda layer: [(0, layer)]
+                worker._compute_reachable_store_masks = lambda request: None
+                worker._prepare_load_gvas = lambda requests: None
+                worker._alloc_gvas_for_save = lambda requests: None
+
+                def populate(tasks, layer, request=request):
+                    if layer < 2:
+                        tasks[layer].append(LayerTransferTask(layer, [LayerBlockRange(request, 0, 1)]))
+
+                def prepare_save(requests, layer, *args, worker=worker, populate=populate):
+                    return populate(worker.layer_save_tasks, layer)
+
+                def prepare_load(requests, layer, *args, worker=worker, path=path, populate=populate):
+                    return populate(worker.layer_load_tasks, layer) if path == "gva" else None
+
+                worker._process_save_for_layer_batch = prepare_save
+                worker._process_load_for_layer_batch = prepare_load
+                with self.assertLogs(pool_diag.diag._LOG, level="INFO") as captured:
+                    worker.process_layer_data([request])
+
+                records = [json.loads(r.getMessage().split("[PD_DIAG] ", 1)[1]) for r in captured.records]
+                summaries = [record for record in records if record["event"] == "pool_task"]
+                self.assertEqual(len(summaries), 2 if path == "gva" else 1)
+                expected = {"save_prepare", "load_prepare"} if path == "gva" else {"save_key_prepare"}
+                self.assertEqual({summary["operation"] for summary in summaries}, expected)
+                for summary in summaries:
+                    self.assertEqual(summary["version"], 2)
+                    self.assertEqual(set(summary["stages"]), {"build_key", "lookup", "prepare", "sync", "put"})
+                    self.assertEqual(summary["request_id"], request.req_id)
+                    self.assertEqual(summary["execution_id"], request.pd_execution_id)
+                    self.assertEqual(summary["member_count"], 1)
+                    self.assertIsNone(summary["queue_enter_ns"])
+                    self.assertFalse(summary["incomplete"])
+                    stage = summary["stages"]["prepare" if path == "gva" else "build_key"]
+                    self.assertEqual(stage["calls"], 1)
+                    self.assertEqual(stage["exceptions"], 0)
+                    self.assertGreaterEqual(stage["duration_ns"], 0)
+                first, second = (worker.layer_save_tasks[layer][0] for layer in range(2))
+                if path == "gva":
+                    self.assertIs(first.shared_block_data, second.shared_block_data)
+                    np.testing.assert_array_equal(first.shared_block_data.block_gvas_arr, [100])
+                    first_load, second_load = (worker.layer_load_tasks[layer][0] for layer in range(2))
+                    self.assertIs(first_load.shared_block_data, second_load.shared_block_data)
+                    np.testing.assert_array_equal(first_load.shared_block_data.block_gvas_arr, [200])
+                else:
+                    self.assertIs(first.cached_process_tokens, second.cached_process_tokens)
+                    self.assertEqual(first.cached_process_tokens, {0: [(0, 16, ["layer-0", "layer-1", "layer-2"])]})
 
     def test_build_shared_save_data_marks_last_actual_task(self):
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise.kv_transfer import (

@@ -85,6 +85,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -118,6 +119,7 @@ from vllm.v1.worker.utils import (
     AttentionGroup,
     raise_if_nan_logits,
 )
+from vllm.v1.worker.worker_base import pd_execution, pd_sample
 
 # yapf: enable
 from vllm_ascend.ascend_config import get_ascend_config
@@ -2344,6 +2346,7 @@ class NPUModelRunner(GPUModelRunner):
         return cut_tokens
 
     @torch.inference_mode()
+    @pd_execution
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -2879,6 +2882,7 @@ class NPUModelRunner(GPUModelRunner):
         self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
 
     @torch.inference_mode()
+    @pd_sample
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
@@ -3077,20 +3081,22 @@ class NPUModelRunner(GPUModelRunner):
         if spec_decode_metadata is None:
             if lmhead_tp_enable() and logits is not None:
                 logits = logits[: self.input_batch.num_reqs]
-            return self.sampler(
-                logits=logits,
-                sampling_metadata=sampling_metadata,
-            )
+            with diag.span("runner.sampling", algorithm="sampler", completion="host_return"):
+                return self.sampler(
+                    logits=logits,
+                    sampling_metadata=sampling_metadata,
+                )
 
         if lmhead_tp_enable() and logits is not None:
             logits = logits[: len(spec_decode_metadata.logits_indices)]
         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
-        sampler_output = self.rejection_sampler(
-            spec_decode_metadata,
-            draft_probs,
-            logits,
-            sampling_metadata,
-        )
+        with diag.span("runner.sampling", algorithm="rejection", completion="host_return"):
+            sampler_output = self.rejection_sampler(
+                spec_decode_metadata,
+                draft_probs,
+                logits,
+                sampling_metadata,
+            )
         return sampler_output
 
     def _get_nans_in_logits(self, logits: torch.Tensor | None) -> dict[str, int]:
@@ -3561,9 +3567,11 @@ class NPUModelRunner(GPUModelRunner):
             if self.enable_enpu:
                 # The soft segmentation scenario requires event.record first, then event.wait
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
-                hidden_states = run_model()
+                with diag.span("runner.forward", completion="host_return"):
+                    hidden_states = run_model()
             else:
-                hidden_states = run_model()
+                with diag.span("runner.forward", completion="host_return"):
+                    hidden_states = run_model()
                 self._update_full_graph_params_if_needed(forward_context, num_tokens_padded)
         finally:
             # A forward that raises must still retire the device-metadata
