@@ -904,7 +904,7 @@ class NPUWorker(WorkerBase):
 
         if self.profiler is not None:
             self.profiler.step()
-
+        #===========  │ Worker 把本轮调度安排交给 model runner。
         output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
         if self.use_v2_model_runner and self.model_runner.is_pooling_model and output is None:
             output = self.model_runner.pool()  # type: ignore
